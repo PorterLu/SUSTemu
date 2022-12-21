@@ -31,7 +31,8 @@ void host_write(void *addr, int len, word_t data) {
 
 word_t paddr_read(paddr_t addr, int len)
 {
-	//pmp_check(addr, false, false);
+	pmp_check(addr, false, false);
+	addr = addr & 0xffffffff;
 	if(addr >= 0x80000000 && addr <= 0x88000000)
 		return host_read(guest_to_host(addr), len);
 	else
@@ -42,7 +43,8 @@ word_t paddr_read(paddr_t addr, int len)
 
 void paddr_write(paddr_t addr, int len, word_t data)
 {
-	//pmp_check(addr, false, true);
+	pmp_check(addr, false, true);
+	addr = addr & 0xffffffff;
 	if(addr >= 0x80000000 && addr <= 0x88000000){
 		host_write(guest_to_host(addr), len, data);
 		return;
@@ -51,5 +53,5 @@ void paddr_write(paddr_t addr, int len, word_t data)
 		mmio_write(addr, len, data);
 }
 
-uint8_t* guest_to_host(paddr_t paddr) { return pmem + paddr - MBASE;}
+uint8_t* guest_to_host(paddr_t paddr) { return pmem +  paddr - MBASE;}
 paddr_t host_to_guest(uint8_t *haddr) { return haddr - pmem + MBASE;}

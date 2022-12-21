@@ -112,6 +112,7 @@ trap_vector:
 #	csrw	mscratch, t6
 #	ld		t6, 0(sp)
 	csrrw	t6, mscratch, t6			//将mscratch中的上下文指针存在t6
+	la		t6, context_buffer
 	reg_save t6							//保存除了t6外的上下文
 
 	mv		t5, t6						//单独存储t6

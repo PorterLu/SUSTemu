@@ -1,6 +1,7 @@
 #define FLASH_BASE_ADDR 0x30000000
 #define BITCOIN_TASK 0x80200000
 #include <stdint.h>
+#include "security_monitor.h"
 
 extern void trap_vector();
 uint8_t publick_key[32] = {0x03,0x61,0x08,0x2a,0x8a,0x35,0x4c,0xe2,0xad,0xe2,0x98,0x01,0x1d,0x8c,0xcc,0x26,0x93,0xfd,0xa1,0x68,0x97,0x77,0x66,0x37,0x94,0x69,0xc0,0x04,0x80,0x23,0x8a,0x40};
@@ -13,15 +14,29 @@ void ramdisk_read(){
 		}
 }
 
+struct context ctx;
+
 int main(){
-	 asm volatile(" auipc t0, 0;"
-				   "li 	  t1, 0x64;"
+	 asm volatile( "lui	t0, 0x80000;"
+	 			   "csrw  pmpaddr0, t0;"
+				   "li	 t0, 0xf;"
+				   "csrw  pmpcfg0, t0;"
+				   " auipc t0, 0;"
+				   "li 	  t1, 0x100;"
 				   "slli  t1, t1, 12;"
 				   "add	  t0, t0, t1;" 
-				   "csrw	 pmpaddr0, t0;"
-				   "li	  t0, 8;"
-				   "csrw	 pmpcfg0, t0;"
+				   "csrw  pmpaddr2, t0;"
+				   "li	  t0, 0x8;"
+				   "csrw  pmpcfg2, t0;"
+				   "lui	  t0, 0x80500;"
+				   "addi  t0, t0, -1;"
+				   "csrw  pmpaddr4, t0;"
+				   "li	  t0, 0xf;"
+				   "csrw  pmpcfg4, t0;"
 				   "csrw  mtvec, %0"::"r"(trap_vector):);
 	ramdisk_read();
-	((void(*)())BITCOIN_TASK)();	   
+	//((void(*)())BITCOIN_TASK)();	   
+	asm volatile("mv	t0, %0;"
+				 "csrw	mepc, t0;"
+				 "mret;"::"r"(BITCOIN_TASK));
 }

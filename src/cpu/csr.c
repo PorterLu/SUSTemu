@@ -55,7 +55,7 @@ void mret_priv_transfer(){
 	priv_level = (csr.mstatus & 0x18000) >> 11;
 	csr.mstatus = csr.mstatus & (~(uint64_t)0x18000);
 	csr.mstatus = ((csr.mstatus & 0x80) >> 4) | (csr.mstatus & (~(uint64_t)0x80));
-	csr.mstatus = csr.mstatus | 0x80; 
+	csr.mstatus = csr.mstatus | 0x80;
 }
 
 void exception_priv_transfer(){
@@ -64,10 +64,11 @@ void exception_priv_transfer(){
 	priv_level = MACHINE;
 	csr.mstatus = ((csr.mstatus & 0x08) << 4) | (csr.mstatus & (~(uint64_t)0x80));
 	csr.mstatus = csr.mstatus & ~(uint64_t)0x08;
+	//printf("sbi call\n");
 }
 
 bool is_pmp_on(uint8_t pmp_id){
-	return pmpcfg[pmp_id] & 0x1f;
+	return pmpcfg[pmp_id] & 0x18;
 }
 
 void set_pmpcfg(uint8_t id, uint8_t data){
@@ -84,8 +85,8 @@ void set_pmpcfg(uint8_t id, uint8_t data){
 }
 
 void set_csr(uint64_t no, uint64_t data){
-	//if(!priv_check(no, true))
-	//	return;
+	if(!priv_check(no, true))
+		return;
 
 	switch(no){
 		case MEPC:
@@ -186,8 +187,8 @@ void set_csr(uint64_t no, uint64_t data){
 }
 
 word_t read_csr(uint64_t no){
-	//if(!priv_check(no, false))
-	//	return 0xbadbeef;
+	if(!priv_check(no, false))
+		return 0xbadbeef;
 
 	switch(no){
 		case MEPC: return csr.mepc;
@@ -228,8 +229,8 @@ word_t read_csr(uint64_t no){
 		case PMPADDRE: return pmpcfg[0xe/2];
 	}
 
-	return csr.mscratch;
-	//Assert(0, "unknown no:%lx\n", no);
+	//return csr.mscratch;
+	Assert(0, "unknown no:%lx\n", no);
 }
 
 word_t raise_intr(word_t NO, vaddr_t epc, uint32_t args){
@@ -241,10 +242,12 @@ word_t raise_intr(word_t NO, vaddr_t epc, uint32_t args){
 bool priv_check(uint64_t no, bool is_write){
 	int i;
 	bool pass = false;
+
 	for(i = 0; i < sizeof(csr_table); i++){
 		if(no == csr_table[i][0]){
 			if(priv_level < csr_table[i][1] || (!is_write && !csr_table[i][2]) || (is_write && !csr_table[i][3])){
 				set_bad();
+				state = NEMU_ABORT;
 				printf(ANSI_FMT("Privilege Check fail\n", ANSI_FG_RED));
 				return false;
 			}
@@ -262,10 +265,14 @@ bool pmp_check(paddr_t addr, bool is_execute, bool is_write){
 	
 	int i;
 	//we only support any address pmp
+	//printf("mode: %ld\n", priv_level);
+	//printf("addr:%lx\n", addr);
 	for(i = 0; i < PMP_NUMBER_IN_SUSTEMU; i++){
+		//printf("pmpaddr%d: %lx\n", i, pmpaddr[i]);
 		if(is_pmp_on(0) && (i == 0) && addr< pmpaddr[0]){
 			if((!(pmpcfg[0]&1) && !is_write) || (!(pmpcfg[0]&2) && is_write) || (!(pmpcfg[0]&4) && is_execute)){
 				set_bad();
+				state = NEMU_ABORT;
 				printf(ANSI_FMT("PMP Check fail\n", ANSI_FG_RED));
 				return false;
 			}
@@ -273,6 +280,7 @@ bool pmp_check(paddr_t addr, bool is_execute, bool is_write){
 		} else if(is_pmp_on(i) && addr >= pmpaddr[i-1] && addr <= pmpaddr[i]){
 			if((!(pmpcfg[i]&1) && !is_write) || (!(pmpcfg[i]&2) && is_write) || (!(pmpcfg[i]&4) && is_execute)){
 				set_bad();
+				state = NEMU_ABORT;
 				printf(ANSI_FMT("PMP Check fail\n", ANSI_FG_RED));
 				return false;
 			}	
@@ -285,6 +293,7 @@ bool pmp_check(paddr_t addr, bool is_execute, bool is_write){
 	else {
 		if(pmp_on_count){
 			set_bad();
+			state = NEMU_ABORT;
 			printf(ANSI_FMT("PMP Check fail\n", ANSI_FG_RED));
 			return false;
 		}else{

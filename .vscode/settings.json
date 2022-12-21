@@ -14,7 +14,8 @@
 		"vysyx_22041812_mycpu__dpi.h": "c",
 		"vysyx_22041812_mycpu.h": "c",
 		"reg.h": "c",
-		"stdlib.h": "c"
+		"stdlib.h": "c",
+		"mtrace.h": "c"
 	},
 	"files.watcherExclude": {
 		"**/target": true

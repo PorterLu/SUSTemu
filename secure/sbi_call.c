@@ -21,7 +21,7 @@ uint8_t p_signature[ECC_BYTES*2];
 #define VERIFY_A_TRANSACTION 2
 extern uint8_t publick_key[32];
 extern uint8_t private_key[32];
-void trap_handler(struct context *ctx){
+uint64_t trap_handler(struct context *ctx){
 	printf("entering enclave\n");
 	switch(ctx->a7){
 		case SIGN_A_TRANSACTION:{
