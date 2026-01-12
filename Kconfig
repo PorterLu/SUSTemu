@@ -16,6 +16,10 @@ config timer
 config serial
 	bool "serial"
 	default y
+
+config flash
+        bool "flash"
+        default n
 endmenu
 
 menu "trace"

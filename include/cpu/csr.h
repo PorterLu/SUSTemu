@@ -2,7 +2,18 @@
 #define __CSR_H__
 #include <common.h>
 
+/* PMP 常量定义 */
 #define PMP_NUMBER_IN_SUSTEMU 8
+#define PMP_R     0x01
+#define PMP_W     0x02
+#define PMP_X     0x04
+#define PMP_A     0x18
+#define PMP_L     0x80
+#define PMP_A_OFF   0x00
+#define PMP_A_TOR   0x08
+#define PMP_A_NA4   0x10
+#define PMP_A_NAPOT 0x18
+
 
 #define MSTATUS 0x300
 #define MISA	0x301
@@ -34,13 +45,14 @@
 #define PMPCFGC	0x3ac
 #define PMPCFGE	0x3ae
 #define PMPADDR0 0x3b0
+#define PMPADDR1 0x3b1
 #define PMPADDR2 0x3b2
+#define PMPADDR3 0x3b3
 #define PMPADDR4 0x3b4
+#define PMPADDR5 0x3b5
 #define PMPADDR6 0x3b6
+#define PMPADDR7 0x3b7
 #define PMPADDR8 0x3b8
-#define PMPADDRA 0x3ba
-#define PMPADDRC 0x3bc
-#define PMPADDRE 0x3be
 
 enum {
 	USER,

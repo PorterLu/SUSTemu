@@ -2,7 +2,7 @@
 #define __IMG_H__
 #include <common.h>
 
-extern char* img_file;
+extern char *img_file;
 void init_default_program();
 long load_img();
 

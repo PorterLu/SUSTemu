@@ -75,7 +75,9 @@ int main(int argc, char *argv[]){
     ____) || |__| | ____) |   | |   | |____ | |  | || |__| |\n\
    |_____/  \\____/ |_____/    |_|   |______||_|  |_| \\____/\n\n", ANSI_FG_BLUE));
 
+#ifdef CONFIG_flash
 	init_flash();
+#endif
 
 #ifdef CONFIG_serial
 	init_serial();

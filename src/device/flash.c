@@ -1,6 +1,7 @@
 #include <mmio.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <assert.h>
 #include "flash.h"
 
 uint8_t *flash_base = NULL;
@@ -13,7 +14,11 @@ long init_flash(){
 	add_mmio_map("flash", FLASH_BASE_ADDR, flash_base, 0x100000, flash_io_handler);
 	
 	FILE *fp = fopen(task_file, "rb");
-	//assert(fp, "Can not open %s", task_file);
+        if(!fp) {
+                printf("No task_file found\n");
+                return 0;
+        }
+
 
 	fseek(fp, 0, SEEK_END);
 	long size = ftell(fp);
