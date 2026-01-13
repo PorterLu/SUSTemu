@@ -21,6 +21,7 @@
 #include <mmio.h>
 #include <decode.h>
 #include <flash.h>
+#include <cache.h>
 
 char* elf_file = NULL;
 
@@ -74,6 +75,8 @@ int main(int argc, char *argv[]){
     \\___ \\ | |  | | \\___ \\    | |   |  __|  | |\\/| || |  | |\n\
     ____) || |__| | ____) |   | |   | |____ | |  | || |__| |\n\
    |_____/  \\____/ |_____/    |_|   |______||_|  |_| \\____/\n\n", ANSI_FG_BLUE));
+
+	init_cache_system();
 
 #ifdef CONFIG_flash
 	init_flash();

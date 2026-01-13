@@ -38,6 +38,9 @@ LDFLAGS = -O2 $(LIBS) -lLLVM-11
 all: $(TARGET)
 	@echo $< over
 
+test: all 
+	./build/sustemu -e ./os_test/os.elf -l log.txt ./os_test/os.bin
+
 $(TARGET): $(OBJS)
 	@$(LD) -o $@ $(OBJS) $(LDFLAGS) $(LIBS) 
 

@@ -18,6 +18,7 @@
 #include <keyboard.h>
 #include <SDL2/SDL.h>
 #include <ringbuf.h>
+#include <cache.h>
 
 static bool is_batch_mode = false;
 
@@ -78,6 +79,8 @@ static int cmd_info(char *args){
 		reg_display();
 	if(strcmp(arg, "w") == 0)
 		print_wp();
+	if(strcmp(arg, "c") == 0)
+		cache_report(L1I_cache), cache_report(L1D_cache), cache_report(L2_cache);
 	return 0;
 }
 
