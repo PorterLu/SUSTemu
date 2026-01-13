@@ -165,13 +165,24 @@ bool priv_check(uint64_t no, bool is_write){
 	int num = sizeof(csr_table) / sizeof(csr_table[0]);
 	for(int i = 0; i < num; i++){
 		if(no == csr_table[i][0]){
-			if(priv_level < csr_table[i][1] || (!is_write && !csr_table[i][2]) || (is_write && !csr_table[i][3])){
+			if(priv_level < csr_table[i][1]){
 				set_bad();
 				state = NEMU_ABORT;
 				printf(ANSI_FMT("Privilege Check fail\n", ANSI_FG_RED));
 				return false;
-			}
-			return true;
+			} else if(!is_write && !csr_table[i][2]) {
+                                set_bad();
+                                state = NEMU_ABORT;
+                                printf(ANSI_FMT("Can not be Read\n", ANSI_FG_RED));
+                                return false;
+                        } else if(is_write && !csr_table[i][3]) {
+                                set_bad();
+                                state = NEMU_ABORT;
+                                printf(ANSI_FMT("Write to Read-only CSR\n", ANSI_FG_RED));
+                                return false;
+                        } else {
+			        return true;
+                        }
 		}
 	}
 	return false;

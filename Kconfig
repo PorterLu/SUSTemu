@@ -33,7 +33,7 @@ config mtrace
 
 config itrace
 	bool "itrace"
-	default y
+	default n
 
 config ringbuf
 	bool "ringbuf"

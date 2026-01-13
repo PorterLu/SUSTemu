@@ -4,7 +4,7 @@
 Decode s;
 
 void init_decode_info(){
-	s.dnpc = s.snpc = 0xffffffff80000000;
+	s.dnpc = s.snpc = 0x80000000;
 }
 
 void decode_operand(Decode *s, word_t *dest, word_t *src1, word_t *src2, int type) {

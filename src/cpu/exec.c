@@ -91,10 +91,10 @@ INSTPAT_START();
   INSTPAT("0000000 ????? ????? 001 ????? 01110 11", sllw   , R, R(dest) = SEXT(((src1&0xffffffff) << (src2&0x1f))&0xffffffff, 32));
   INSTPAT("0000000 ????? ????? 001 ????? 00110 11", slliw  , I, R(dest) = SEXT(((src1&0xffffffff) << src2)&0xffffffff, 32));
   INSTPAT("0000000 ????? ????? 101 ????? 00110 11", srliw  , I, R(dest) = SEXT(((src1&0xffffffff) >> src2)&0xffffffff, 32));
-  INSTPAT("??????? ????? ????? 001 ????? 11100 11", csrrw  , I, R(dest) = read_csr(src2 & 0xfff); set_csr(src2 & 0xfff, src1));
+  INSTPAT("??????? ????? ????? 001 ????? 11100 11", csrrw  , I, if(src2 != 0) R(dest) = read_csr(src2 & 0xfff); set_csr(src2 & 0xfff, src1));
   INSTPAT("0000000 00000 00000 000 00000 11100 11", ecall  , I, s->dnpc = raise_intr(11, cpu.pc, cpu.gpr[17]); exception_priv_transfer());
-  INSTPAT("??????? ????? ????? 010 ????? 11100 11", csrrs  , I, R(dest) = read_csr(src2 & 0xfff); set_csr(src2 &0xfff, read_csr(src2 & 0xfff) | src1));
-  INSTPAT("??????? ????? ????? 011 ????? 11100 11", csrrc  , I, R(dest) = read_csr(src2 & 0xfff); set_csr(src2 & 0xfff, read_csr(src2 & 0xfff) & (~src1)));
+  INSTPAT("??????? ????? ????? 010 ????? 11100 11", csrrs  , I, R(dest) = read_csr(src2 & 0xfff); if(src1 != 0) set_csr(src2 &0xfff, read_csr(src2 & 0xfff) | src1));
+  INSTPAT("??????? ????? ????? 011 ????? 11100 11", csrrc  , I, R(dest) = read_csr(src2 & 0xfff); if(src1 != 0) set_csr(src2 & 0xfff, read_csr(src2 & 0xfff) & (~src1)));
   INSTPAT("0011000 00010 00000 000 00000 11100 11", mret   , R, s->dnpc = read_csr(MEPC & 0xfff); mret_priv_transfer());
   INSTPAT("0000000 00001 00000 000 00000 11100 11", ebreak , N, state=NEMU_END; );      // R(10) is $a0
   INSTPAT("0000000 00000 00000 001 00000 00011 11", fence_i, I, R(0) = 0);
