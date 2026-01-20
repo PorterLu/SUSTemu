@@ -1,35 +1,36 @@
-ENTRY(_start)
+OUTPUT_ARCH( "riscv" )
+ENTRY( _start )
 
-SECTIONS {
-  . = 0x80200000;
+SECTIONS
+{
+  . = 0x80000000;
+
+  /* 代码段 */
   .text : {
-    *(entry)
-    *(.text*)
+    *(.text.init) /* 确保启动汇编排在最前面 */
+    *(.text .text.*)
   }
-  etext = .;
-  _etext = .;
+
+  /* 只读数据段 */
   .rodata : {
-    *(.rodata*)
+    *(.rodata .rodata.*)
   }
-  .htif : {
-    PROVIDE(__htif_base = . );
-    *(.htif)
-  }
+
+  /* 已初始化数据段 */
   .data : {
-    *(.data)
+    *(.data .data.*)
   }
-  edata = .;
-  _data = .;
+
+  /* 未初始化数据段 */
   .bss : {
-	_bss_start = .;
-    *(.bss*)
-    *(.sbss*)
-    *(.scommon)
+    __bss_start = .;
+    *(.bss .bss.*)
+    *(COMMON)
+    __bss_end = .;
   }
-  _stack_top = ALIGN(0x1000);
-  . = _stack_top + 0x8000;
-  _stack_pointer = .;
-  end = .;
-  _end = .;
-  _heap_start = ALIGN(0x1000);
+
+  /* 定义堆栈顶端 (向下增长) */
+  . = ALIGN(16);
+  . += 0x1000; /* 4KB 栈空间 */
+  _stack_top = .;
 }

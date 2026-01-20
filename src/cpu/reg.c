@@ -35,6 +35,11 @@ void reg_display(){
 	printf("mstatus: %lx\n", csr.mstatus);
 }
 
+void init_regs() {
+	memset(&cpu, 0, sizeof(CPU_state));
+	cpu.pc = 0x80000000;
+}
+
 word_t reg_str2val(const char *s, bool *success){
 	int i;
 	for(i = 0; i < NR_REG; i++){

@@ -2,12 +2,8 @@
 #define __CACHE_H__
 #include <common.h>
 
-/* --- 常量定义 --- */
 #define BLOCK_SIZE 64      // 64字节块大小
 #define WORD_SIZE  8       // 每次访存单位（word_t）
-
-
-/* --- 数据结构 --- */
 typedef struct {
     int valid;
     int dirty;
@@ -22,8 +18,8 @@ typedef struct {
 
 typedef struct {
     int s;      // 组索引位 (2^s sets)
-    int E;      // 关联度
-    int b;      // 块偏移位 (2^b = BLOCK_SIZE, 这里应该是 6)
+    int w;      // 关联度
+    int off;    // 块偏移位 (2^b = BLOCK_SIZE, 这里应该是 6)
     CacheSet *sets;
     uint64_t timer;
     char *name;

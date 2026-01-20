@@ -68,6 +68,7 @@ int main(int argc, char *argv[]){
 	init_elf(elf_file);
 	init_map();
 	init_decode_info();
+	init_regs();
 
 	printf(ANSI_FMT("     _____  _    _   _____  _______  ______  __  __  _    _\n\
     / ____|| |  | | / ____||__   __||  ____||  \\/  || |  | |\n\

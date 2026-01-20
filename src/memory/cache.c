@@ -26,32 +26,30 @@ static void store_block_to_mem(paddr_t block_paddr, uint8_t *src) {
     }
 }
 
-/* --- 初始化函数 --- */
-Cache* init_cache(int s, int E, char *name) {
+// 初始化 Cache 结构
+Cache* init_cache(int s, int w, char *name) {
     Cache *c = (Cache *)calloc(1, sizeof(Cache));
-    c->s = s; c->E = E; c->b = 6; // 2^6 = 64
+    c->s = s; c->w = w; c->off = 6; // 2^6 = 64
     c->name = name;
     int S = 1 << s;
     c->sets = (CacheSet *)malloc(S * sizeof(CacheSet));
     for (int i = 0; i < S; i++) {
-        c->sets[i].lines = (CacheLine *)calloc(E, sizeof(CacheLine));
+        c->sets[i].lines = (CacheLine *)calloc(w, sizeof(CacheLine));
     }
     return c;
 }
 
-/* --- 核心查找与 LRU 逻辑 --- */
-
-// 在单层 Cache 中寻找 Block，若未命中则返回牺牲行（Victim）
+// 在单层 Cache 中寻找 Block，若未命中则返回牺牲行
 static CacheLine* find_line(Cache *c, paddr_t addr, int *is_hit) {
     c->timer++;
-    uint64_t set_idx = (addr >> c->b) & ((1ULL << c->s) - 1);
-    uint64_t tag = addr >> (c->s + c->b);
+    uint64_t set_idx = (addr >> c->off) & ((1ULL << c->s) - 1);
+    uint64_t tag = addr >> (c->s + c->off);
     CacheSet *set = &c->sets[set_idx];
 
     int lru_idx = 0;
     uint64_t min_time = UINT64_MAX;
 
-    for (int i = 0; i < c->E; i++) {
+    for (int i = 0; i < c->w; i++) {
         if (set->lines[i].valid && set->lines[i].tag == tag) {
             *is_hit = 1;
             c->hits++;
@@ -69,60 +67,67 @@ static CacheLine* find_line(Cache *c, paddr_t addr, int *is_hit) {
     return &set->lines[lru_idx];
 }
 
-// 核心功能访存：支持 L1 和 L2 的递归交互
-static void fetch_block(Cache *l1, Cache *l2, paddr_t addr, CacheLine *l1_victim) {
+// 统一的 L2 访存接口：is_write 为 true 表示 L1 写回脏块，false 表示 L1 读缺失
+static void access_l2(Cache *l2, paddr_t addr, uint8_t *data, bool is_write) {
+    int hit;
+    CacheLine *l2_line = find_line(l2, addr, &hit);
     paddr_t block_paddr = addr & ~(paddr_t)(BLOCK_SIZE - 1);
-    uint64_t tag_l1 = addr >> (l1->s + l1->b);
 
-    // 1. 处理 L1 驱逐
+    if (hit) {
+        if (is_write) {
+            memcpy(l2_line->data, data, BLOCK_SIZE);
+            l2_line->dirty = 1;
+        } else {
+            memcpy(data, l2_line->data, BLOCK_SIZE);
+        }
+    } else {
+        // L2 Miss: 处理替换逻辑
+        if (l2_line->valid && l2_line->dirty) {
+            l2->evictions++;
+            l2->writebacks++;
+            paddr_t p_l2_addr = (l2_line->tag << (l2->s + l2->off)) | 
+                                (((addr >> l2->off) & ((1ULL << l2->s) - 1)) << l2->off);
+            store_block_to_mem(p_l2_addr, l2_line->data);
+        }
+
+        if (is_write) {
+            // L1 写回 L2：直接覆盖 L2 牺牲行
+            memcpy(l2_line->data, data, BLOCK_SIZE);
+            l2_line->dirty = 1;
+        } else {
+            // L1 缺失从 L2 读：先从内存加载到 L2，再交给 L1
+            load_block_from_mem(block_paddr, l2_line->data);
+            memcpy(data, l2_line->data, BLOCK_SIZE);
+            l2_line->dirty = 0;
+        }
+        l2_line->valid = 1;
+        l2_line->tag = addr >> (l2->s + l2->off);
+    }
+}
+
+static void fetch_block(Cache *l1, Cache *l2, paddr_t addr, CacheLine *l1_victim) {
+    // 1. 如果 L1 牺牲行是脏的，将其写回 L2
     if (l1_victim->valid) {
         l1->evictions++;
         if (l1_victim->dirty) {
-            // L1 脏块写回 L2
             l1->writebacks++;
-            paddr_t v_addr = (l1_victim->tag << (l1->s + l1->b)) | 
-                             (((addr >> l1->b) & ((1ULL << l1->s) - 1)) << l1->b);
-            int hit_l2;
-            CacheLine *l2_line = find_line(l2, v_addr, &hit_l2);
-            // 将数据拷入 L2 对应行（无论 L2 之前是否命中，强制更新/分配）
-            memcpy(l2_line->data, l1_victim->data, BLOCK_SIZE);
-            l2_line->valid = 1;
-            l2_line->dirty = 1; 
-            l2_line->tag = v_addr >> (l2->s + l2->b);
-            l2_line->last_access = l2->timer;
+            paddr_t p_l1_addr = (l1_victim->tag << (l1->s + l1->off)) | 
+                                (((addr >> l1->off) & ((1ULL << l1->s) - 1)) << l1->off);
+            access_l2(l2, p_l1_addr, l1_victim->data, true);
         }
     }
 
-    // 2. 从 L2 或 内存 加载新块到 L1
-    int hit_l2;
-    CacheLine *l2_line = find_line(l2, addr, &hit_l2);
-    if (!hit_l2) {
-        // L2 Miss: 检查 L2 驱逐
-        if (l2_line->valid) {
-            l2->evictions++;
-            if (l2_line->dirty) {
-                l2->writebacks++;
-                paddr_t v_l2_addr = (l2_line->tag << (l2->s + l2->b)) | 
-                                    (((addr >> l2->b) & ((1ULL << l2->s) - 1)) << l2->b);
-                store_block_to_mem(v_l2_addr, l2_line->data);
-            }
-        }
-        // 从真实内存加载到 L2
-        load_block_from_mem(block_paddr, l2_line->data);
-        l2_line->valid = 1;
-        l2_line->dirty = 0;
-        l2_line->tag = addr >> (l2->s + l2->b);
-    }
+    // 2. 从 L2 获取新块填充到 L1
+    access_l2(l2, addr, l1_victim->data, false);
 
-    // 3. 将数据从 L2 拷入 L1
-    memcpy(l1_victim->data, l2_line->data, BLOCK_SIZE);
+    // 3. 更新 L1 行状态
     l1_victim->valid = 1;
     l1_victim->dirty = 0;
-    l1_victim->tag = tag_l1;
+    l1_victim->tag = addr >> (l1->s + l1->off);
     l1_victim->last_access = l1->timer;
 }
 
-/* --- 对外暴露的读写接口 --- */
+
 word_t cache_read(Cache *l1, Cache *l2, paddr_t addr, int len) {
     int hit;
     CacheLine *line = find_line(l1, addr, &hit);

@@ -4,6 +4,7 @@
 Decode s;
 
 void init_decode_info(){
+  s.pc = 0x80000000;
 	s.dnpc = s.snpc = 0x80000000;
 }
 

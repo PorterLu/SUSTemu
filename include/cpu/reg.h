@@ -17,6 +17,7 @@ extern const char *regs[];
 void dump_gpr();
 void reg_display();
 word_t reg_str2val(const char *s, bool *success);
+void init_regs();
 #define gpr(idx) (cpu.gpr[idx])
 
 #endif
