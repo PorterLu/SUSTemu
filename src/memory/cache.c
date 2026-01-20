@@ -81,7 +81,7 @@ static void access_l2(Cache *l2, paddr_t addr, uint8_t *data, bool is_write) {
             memcpy(data, l2_line->data, BLOCK_SIZE);
         }
     } else {
-        // L2 Miss: 处理替换逻辑
+        // 不命中 L2，需要处理 L2 Victim Line
         if (l2_line->valid && l2_line->dirty) {
             l2->evictions++;
             l2->writebacks++;
@@ -91,7 +91,7 @@ static void access_l2(Cache *l2, paddr_t addr, uint8_t *data, bool is_write) {
         }
 
         if (is_write) {
-            // L1 写回 L2：直接覆盖 L2 牺牲行
+            // L1 写回 L2：直接覆盖 L2 Victim Line
             memcpy(l2_line->data, data, BLOCK_SIZE);
             l2_line->dirty = 1;
         } else {

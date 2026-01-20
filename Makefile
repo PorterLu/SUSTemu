@@ -39,7 +39,8 @@ all: $(TARGET)
 	@echo $< over
 
 test: all 
-	./build/sustemu -e ./os_test/os.elf -l log.txt ./os_test/os.bin
+	make -C ./test
+	./build/sustemu -e ./test/kernel.elf -l log.txt ./test/kernel.bin
 
 $(TARGET): $(OBJS)
 	@$(LD) -o $@ $(OBJS) $(LDFLAGS) $(LIBS) 
@@ -64,6 +65,7 @@ clean:
 	find ./ -name "*.o" | xargs rm -rf
 	find ./ -name "*.d" | xargs rm -rf
 	rm $(LOG_FILE) -rf
+	make -C ./test clean
 
 menuconfig:
 	mkdir -p ./build

@@ -57,8 +57,5 @@ int main() {
     
     test_performance();
 
-    while (1) {
-        // 挂起或循环
-    }
     return 0;
 }

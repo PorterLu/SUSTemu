@@ -111,7 +111,7 @@ static void exec_once()
 {
 	uint64_t old_pc = cpu.pc;
 	pmp_check(s.snpc, true, false);
-	s.inst.val = vaddr_read(s.snpc, 4);
+	s.inst.val = vaddr_ifetch(s.snpc, 4);
 	s.snpc += 4;
 	decode_exec(&s);
 	cpu.pc = s.pc = s.dnpc;

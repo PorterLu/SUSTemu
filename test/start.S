@@ -16,5 +16,5 @@ bss_clear:
 
 bss_done:
     # 4. 跳转到 C 语言入口
-    tail main
+    call main
     ebreak
