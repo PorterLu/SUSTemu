@@ -35,6 +35,7 @@
 #include <watchpoint.h>
 #include <decode.h>
 #include <inttypes.h>
+#include <csr.h>
 
 /* ── Global pipeline state ──────────────────────────────────────────────── */
 Pipeline  pipe;
@@ -79,6 +80,8 @@ void pipeline_cycle(void)
     stage_ID();
     stage_IF();
     pipe_stats.cycles++;
+    g_sim_cycles++;
+    g_sim_instret = pipe_stats.insts;
 }
 
 /* ── stage_WB ───────────────────────────────────────────────────────────── */

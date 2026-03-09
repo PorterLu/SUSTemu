@@ -36,6 +36,7 @@
 #define SCAUSE	0x142
 #define STVAL	0x143
 #define SIP		0x144
+#define SATP	0x180
 #define PMPCFG0 0x3a0
 #define PMPCFG2 0x3a2
 #define PMPCFG4	0x3a4
@@ -53,6 +54,15 @@
 #define PMPADDR6 0x3b6
 #define PMPADDR7 0x3b7
 #define PMPADDR8 0x3b8
+
+/* Performance counter CSRs (read-only from all privilege levels) */
+#define CYCLE    0xc00   /* rdcycle — cycles executed by this hart */
+#define INSTRET  0xc02   /* rdinstret — instructions retired */
+
+/* Global simulation cycle counter (bumped each pipeline/OOO cycle, or each
+ * instruction in functional mode).  Exposed via CYCLE CSR. */
+extern uint64_t g_sim_cycles;
+extern uint64_t g_sim_instret;
 
 enum {
 	USER,
@@ -80,6 +90,7 @@ typedef struct {
 	word_t sip;
 	word_t stval;
 	word_t stvec;
+	word_t satp;
 	word_t sscratch;
 } CSR;
 

@@ -5,6 +5,8 @@
 
 CSR csr;
 uint64_t priv_level = 3;
+uint64_t g_sim_cycles  = 0;
+uint64_t g_sim_instret = 0;
 uint8_t pmpcfg[PMP_NUMBER_IN_SUSTEMU];
 word_t pmpaddr[PMP_NUMBER_IN_SUSTEMU];
 uint8_t pmp_on_count = 0;
@@ -32,6 +34,7 @@ uint32_t csr_table[][4] = {
 	{SCAUSE, SUPERVISOR, true, true},
 	{STVAL, SUPERVISOR, true, true},
 	{SIP, SUPERVISOR, true, true},
+	{SATP, SUPERVISOR, true, true},
 	{PMPCFG0, MACHINE, true, true},
 	{PMPCFG2, MACHINE, true, true},
 	{PMPCFG4, MACHINE, true, true},
@@ -45,6 +48,9 @@ uint32_t csr_table[][4] = {
 	{PMPADDR4, MACHINE, true, true},
 	{PMPADDR6, MACHINE, true, true},
 	{PMPADDR8, MACHINE, true, true},
+	/* Performance counters — readable from all privilege levels */
+	{CYCLE,   USER, true, false},
+	{INSTRET, USER, true, false},
 };
 
 void mret_priv_transfer(){
@@ -99,7 +105,7 @@ void set_csr(uint64_t no, uint64_t data){
 		case SSCRATCH: csr.sscratch = data; return;
 		case STVAL: csr.stval = data; return;
 		case SIP: csr.sip = data; return;
-
+		case SATP: csr.satp = data; return;
 		/* 修正：RV64 下 PMPCFG 寄存器是 64 位的，包含 8 个 PMP 配置 */
 		case PMPCFG0:
 			for(int i=0; i<8; i++) set_pmpcfg(i, (data >> (i*8)) & 0xFF);
@@ -151,6 +157,8 @@ word_t read_csr(uint64_t no){
 		}
 		case PMPADDR0: return pmpaddr[0];
 		case PMPADDR2: return pmpaddr[1];
+		case CYCLE:   return g_sim_cycles;
+		case INSTRET: return g_sim_instret;
 	}
 	Assert(0, "unknown no:%lx\n", no);
 }

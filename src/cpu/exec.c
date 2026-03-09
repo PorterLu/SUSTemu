@@ -60,6 +60,9 @@ static void exec_once()
 	s.dnpc   = ir.dnpc;
 	s.snpc   = ir.dnpc;   /* mirrors old: s.snpc = s.dnpc */
 
+	g_sim_cycles++;   /* functional mode: 1 cycle per instruction */
+	g_sim_instret++;
+
 	/* ── Instruction trace (same format as before) ─────────────── */
 	sprintf(log_buf, "%016lx:    ", pc);
 	for (int i = 0; i < 4; i++)

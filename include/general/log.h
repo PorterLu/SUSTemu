@@ -10,8 +10,7 @@ void init_log(char *log_file);
 
 #define log_write(...) do{ \
 		extern FILE* log_fp;   \
-		fprintf(log_fp, __VA_ARGS__ );\
-		fflush(log_fp); \
+		if(log_fp) { fprintf(log_fp, __VA_ARGS__ ); fflush(log_fp); } \
 	}while(0);
 
 

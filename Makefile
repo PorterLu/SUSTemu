@@ -1,4 +1,4 @@
-.PHONY: all run clean menuconfig bench bench-functional bench-inorder bench-bpred bench-ooo
+.PHONY: all run clean menuconfig bench bench-functional bench-inorder bench-bpred bench-ooo bench-dhrystone
 
 PWD = $(shell pwd)
 OBJ_DIR = $(PWD)/build
@@ -66,8 +66,18 @@ bench-bpred: all
 	./build/sustemu -b --inorder --bpred -e ./test/kernel.elf ./test/kernel.bin
 
 bench-ooo: all
-	make -C ./test
-	./build/sustemu -b --ooo --bpred -e ./test/kernel.elf ./test/kernel.bin
+	make -C ./test/dhrystone
+	@echo "=== OOO engine (Tomasulo + ROB) + BTB/Tournament branch predictor — Dhrystone ==="
+	./build/sustemu -b --ooo --bpred -e ./test/dhrystone/dhrystone.elf -l /dev/null ./test/dhrystone/dhrystone.bin
+
+bench-dhrystone: all
+	make -C ./test/dhrystone
+	@echo "=== Dhrystone 2.1 — Functional mode ==="
+	./build/sustemu -b -e ./test/dhrystone/dhrystone.elf -l /dev/null ./test/dhrystone/dhrystone.bin
+	@echo "=== Dhrystone 2.1 — In-order pipeline + bpred ==="
+	./build/sustemu -b --inorder --bpred -e ./test/dhrystone/dhrystone.elf -l /dev/null ./test/dhrystone/dhrystone.bin
+	@echo "=== Dhrystone 2.1 — OOO engine + bpred ==="
+	./build/sustemu -b --ooo --bpred -e ./test/dhrystone/dhrystone.elf -l /dev/null ./test/dhrystone/dhrystone.bin
 
 $(TARGET): $(OBJS)
 	@$(LD) -o $@ $(OBJS) $(LDFLAGS) $(LIBS) 

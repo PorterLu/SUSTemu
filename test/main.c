@@ -5,7 +5,7 @@
 #define UART_THR      (*(volatile char *)UART_THR_ADDR)
 
 // 测试参数
-#define TEST_SIZE 1024
+#define TEST_SIZE 32*1024
 uint32_t data_buffer[TEST_SIZE];
 
 void uart_putc(char c) {
