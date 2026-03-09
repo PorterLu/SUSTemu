@@ -11,185 +11,127 @@
 #include <SDL2/SDL.h>
 #include <keyboard.h>
 #include <ringbuf.h>
-#include <reg.h>
 #include <pmem.h>
 #include <decode.h>
 #include <csr.h>
+#include <ir.h>
 
 static bool g_print_step = 1;
 extern void halt();
 char log_buf[128];
 
-static int decode_exec(Decode *s) { 
-  word_t dest = 0, src1 = 0, src2 = 0;
-  s->dnpc = s->snpc;                                                                            //默认情况将dnpc赋值snpc
-
-#define INSTPAT_INST(s) ((s)->inst.val)                                                                                        
-#define INSTPAT_MATCH(s, name, type, ... /* body */ ) { \
-  decode_operand(s, &dest, &src1, &src2, concat(TYPE_, type)); \
-  __VA_ARGS__ ; \
-}
-
-INSTPAT_START();                                                                      
-
-  INSTPAT("??????? ????? ????? ??? ????? 00101 11", auipc  , U, R(dest) = src1 + s->pc;);      
-  INSTPAT("??????? ????? ????? ??? ????? 01101 11", lui    , U, R(dest) = src1 &0xfffffffffffff000);
-  INSTPAT("0000000 ????? ????? 000 ????? 01100 11", add    , R, R(dest) = src1 + src2);
-  INSTPAT("??????? ????? ????? 000 ????? 00100 11", addi   , I, R(dest) = src1 + src2);       //li s0,0 伪指令翻译为addi s0,z0,0
-  INSTPAT("0000000 ????? ????? 000 ????? 01110 11", addw   , R, R(dest) = SEXT((src1 + src2)&0xffffffff,32));
-  INSTPAT("??????? ????? ????? 000 ????? 00110 11", addiw  , I, R(dest) = SEXT((src1 + src2)&0xffffffff,32));
-  INSTPAT("0100000 ????? ????? 000 ????? 01100 11", sub    , R, R(dest) = src1 - src2);
-  INSTPAT("0100000 ????? ????? 000 ????? 01110 11", subw   , R, R(dest) = SEXT((src1 - src2)&0xffffffff,32));
-  INSTPAT("0000001 ????? ????? 110 ????? 01100 11", rem    , R, R(dest) = (int64_t)src1 % (int64_t)src2);
-  INSTPAT("0000001 ????? ????? 111 ????? 01100 11", remu   , R, R(dest) = src1 % src2);
-  INSTPAT("0000001 ????? ????? 110 ????? 01110 11", remw   , R, R(dest) = SEXT(((int32_t)(src1 & 0xffffffff)%(int32_t)(src2 & 0xffffffff))&0xffffffff,32));
-  INSTPAT("0000001 ????? ????? 111 ????? 01110 11", remuw  , R, R(dest) = SEXT(((src1 & 0xffffffff)%(src2 & 0xffffffff))&0xffffffff, 32));
-  INSTPAT("0000001 ????? ????? 100 ????? 01100 11", div	   , R, R(dest) = ((int64_t) src1)/((int64_t) src2));
-  INSTPAT("0000001 ????? ????? 101 ????? 01100 11", divu   , R,	R(dest) = src1 / src2);
-  INSTPAT("0000001 ????? ????? 100 ????? 01110 11", divw   , R, R(dest) = SEXT(((int32_t)(src1 & 0xffffffff))/((int32_t)(src2 & 0xffffffff)),32));
-  INSTPAT("0000001 ????? ????? 101 ????? 01110 11", divuw  , R,	R(dest) = SEXT((src1 &0xffffffff)/ (src2 &0xffffffff),32));
-  INSTPAT("0000001 ????? ????? 000 ????? 01110 11", mulw   , R, R(dest) = SEXT(((int32_t)(src1 & 0xffffffff))*((int32_t)(src2 & 0xffffffff)),32));
-  INSTPAT("0000001 ????? ????? 000 ????? 01100 11", mul    , R, R(dest) = src1 * src2);
-  INSTPAT("0000000 ????? ????? 110 ????? 01100 11", or     , R, R(dest) = src1 | src2);
-  INSTPAT("??????? ????? ????? 110 ????? 00100 11", ori	   , I, R(dest) = src1 | src2);
-  INSTPAT("0000000 ????? ????? 100 ????? 01100 11", xor	   , R, R(dest) = src1 ^ src2);
-  INSTPAT("??????? ????? ????? 100 ????? 00100 11", xori   , I, R(dest) = src1 ^ src2);
-  INSTPAT("??????? ????? ????? 111 ????? 00100 11", andi   , I, R(dest) = src1 & src2);
-  INSTPAT("0000000 ????? ????? 111 ????? 01100 11", and    , R, R(dest) = src1 & src2);
-  INSTPAT("??????? ????? ????? ??? ????? 11011 11", jal    , J, R(dest) = s->snpc; s->dnpc = s->pc + src1; if(dest==1 || dest==5)add_ftrace(s->dnpc, true));  //pc已经自加，记得减去4
-  INSTPAT("??????? ????? ????? 000 ????? 11000 11", beq    , B, s->dnpc = (src1 == src2)? s->pc + dest : s->dnpc);
-  INSTPAT("??????? ????? ????? 001 ????? 11000 11", bne    , B, s->dnpc = (src1 != src2)? s->pc + dest : s->dnpc);
-  INSTPAT("??????? ????? ????? 101 ????? 11000 11", bge    , B, s->dnpc = ((int64_t)src1 >= (int64_t)src2)? s->pc + dest : s->dnpc);
-  INSTPAT("??????? ????? ????? 100 ????? 11000 11", blt    , B, s->dnpc = ((int64_t)src1 < (int64_t)src2)? s->pc + dest : s->dnpc);
-  INSTPAT("??????? ????? ????? 111 ????? 11000 11", bgeu   , B, s->dnpc = src1 >= src2 ? s->pc + dest : s->dnpc);
-  INSTPAT("??????? ????? ????? 110 ????? 11000 11", bltu   , B, s->dnpc = src1 < src2 ? s->pc + dest : s->dnpc);
-  INSTPAT("??????? ????? ????? 000 ????? 11001 11", jalr   , I, R(dest) = s->snpc; s->dnpc = (src1 + src2)&(~1); if(dest == 0 && BITS((s)->inst.val, 19, 15) == 1) add_ftrace(s->dnpc,false); else if(dest==1 || dest ==5)add_ftrace(s->dnpc, true));
-  INSTPAT("??????? ????? ????? 011 ????? 00000 11", ld     , I, R(dest) = Mr(src1 + src2, 8));
-  INSTPAT("??????? ????? ????? 010 ????? 00000 11", lw     , I, R(dest) = SEXT(Mr(src1 + src2, 4), 32));
-  INSTPAT("??????? ????? ????? 001 ????? 00000 11", lh     , I, R(dest) = SEXT(Mr(src1 + src2, 2), 16));
-  INSTPAT("??????? ????? ????? 000 ????? 00000 11", lb 	   , I, R(dest) = SEXT(Mr(src1 + src2, 1), 8));
-  INSTPAT("??????? ????? ????? 110 ????? 00000 11", lwu	   , I, R(dest) = UEXT(Mr(src1 + src2, 4), 32));
-  INSTPAT("??????? ????? ????? 101 ????? 00000 11", lhu    , I, R(dest) = UEXT(Mr(src1 + src2, 2), 16));
-  INSTPAT("??????? ????? ????? 100 ????? 00000 11", lbu    , I, R(dest) = UEXT(Mr(src1 + src2, 1), 8));
-  INSTPAT("??????? ????? ????? 011 ????? 01000 11", sd     , S, Mw(src1 + dest, 8, src2););
-  INSTPAT("??????? ????? ????? 001 ????? 01000 11", sh     , S, Mw(src1 + dest, 2, src2));
-  INSTPAT("??????? ????? ????? 000 ????? 01000 11", sb     , S, Mw(src1 + dest, 1, src2));
-  INSTPAT("??????? ????? ????? 010 ????? 01000 11", sw     , S, Mw(src1 + dest, 4, src2));
-  INSTPAT("0000000 ????? ????? 011 ????? 01100 11", sltu   , R, R(dest) = src1 < src2);
-  INSTPAT("0000000 ????? ????? 010 ????? 01100 11", slt    , R, R(dest) = ((int64_t)src1 < (int64_t)src2));
-  INSTPAT("??????? ????? ????? 011 ????? 00100 11", sltiu  , I, R(dest) = src1 < src2);
-  INSTPAT("??????? ????? ????? 010 ????? 00100 11", slti   , I, R(dest) = ((int64_t)src1 < (int64_t)src2));
-  INSTPAT("0100000 ????? ????? 101 ????? 01100 11", sra	   , R,	R(dest) = (int64_t)src1 >> (src2 & 0x3f));
-  INSTPAT("010000? ????? ????? 101 ????? 00100 11", srai   , I, R(dest) = ((int64_t)src1) >> (src2 & 0x3f));
-  INSTPAT("0100000 ????? ????? 101 ????? 01110 11", sraw   , R, R(dest) = SEXT(((int32_t)(src1&0xffffffff)) >> (src2&0x1f),32));
-  INSTPAT("0100000 ????? ????? 101 ????? 00110 11", sraiw  , I, R(dest) = SEXT(((int32_t)(src1&0xffffffff)) >> (src2&0x1f),32));
-  INSTPAT("000000? ????? ????? 001 ????? 00100 11", slli   , I, R(dest) = src1 << src2);
-  INSTPAT("0000000 ????? ????? 001 ????? 01100 11", sll    , R, R(dest) = src1 << (src2 & 0x3f));
-  INSTPAT("0000000 ????? ????? 101 ????? 01100 11", srl	   , R, R(dest) = src1 >> (src2 & 0x3f));
-  INSTPAT("000000? ????? ????? 101 ????? 00100 11", srli   , I, R(dest) = src1 >> src2);
-  INSTPAT("0000000 ????? ????? 101 ????? 01110 11", srlw   , R, R(dest) = SEXT(((src1&0xffffffff) >> (src2&0x1f))&0xffffffff,32));
-  INSTPAT("0000000 ????? ????? 001 ????? 01110 11", sllw   , R, R(dest) = SEXT(((src1&0xffffffff) << (src2&0x1f))&0xffffffff, 32));
-  INSTPAT("0000000 ????? ????? 001 ????? 00110 11", slliw  , I, R(dest) = SEXT(((src1&0xffffffff) << src2)&0xffffffff, 32));
-  INSTPAT("0000000 ????? ????? 101 ????? 00110 11", srliw  , I, R(dest) = SEXT(((src1&0xffffffff) >> src2)&0xffffffff, 32));
-  INSTPAT("??????? ????? ????? 001 ????? 11100 11", csrrw  , I, if(src2 != 0) R(dest) = read_csr(src2 & 0xfff); set_csr(src2 & 0xfff, src1));
-  INSTPAT("0000000 00000 00000 000 00000 11100 11", ecall  , I, s->dnpc = raise_intr(11, cpu.pc, cpu.gpr[17]); exception_priv_transfer());
-  INSTPAT("??????? ????? ????? 010 ????? 11100 11", csrrs  , I, R(dest) = read_csr(src2 & 0xfff); if(src1 != 0) set_csr(src2 &0xfff, read_csr(src2 & 0xfff) | src1));
-  INSTPAT("??????? ????? ????? 011 ????? 11100 11", csrrc  , I, R(dest) = read_csr(src2 & 0xfff); if(src1 != 0) set_csr(src2 & 0xfff, read_csr(src2 & 0xfff) & (~src1)));
-  INSTPAT("0011000 00010 00000 000 00000 11100 11", mret   , R, s->dnpc = read_csr(MEPC & 0xfff); mret_priv_transfer());
-  INSTPAT("0000000 00001 00000 000 00000 11100 11", ebreak , N, state=NEMU_END; );      // R(10) is $a0
-  INSTPAT("0000000 00000 00000 001 00000 00011 11", fence_i, I, R(0) = 0);
-  INSTPAT("??????? ????? ????? ??? ????? ????? ??", inv    , N, INV(s->pc));            // 作一个default命令，任何没有被定义的opcode都会执行这个命令
-  INSTPAT_END();
-  
-  //到这里就可以看到操作
-  R(0) = 0; // reset $zero to 0
-
-  return 0;
-}
-
+/*
+ * exec_once — fetch, decode (IR), execute, writeback one instruction.
+ *
+ * This replaces the old single-pass decode_exec() approach with the
+ * three-step IR pipeline introduced in Phase 1:
+ *
+ *   1. ir_decode    — pattern-match raw bits → IR_Inst (operands + exec_fn)
+ *   2. ir_execute   — call exec_fn → compute result / dnpc / side-effects
+ *   3. ir_writeback — commit result to GPR file
+ *
+ * The global `s` (Decode) struct is kept up-to-date so that the SDB
+ * monitor and disassembler continue to work without changes.
+ */
 static void exec_once()
 {
-	uint64_t old_pc = cpu.pc;
-	pmp_check(s.snpc, true, false);
-	s.inst.val = vaddr_ifetch(s.snpc, 4);
-	s.snpc += 4;
-	decode_exec(&s);
-	cpu.pc = s.pc = s.dnpc;
-	s.snpc = s.dnpc;
+	vaddr_t pc   = cpu.pc;
+	vaddr_t snpc = pc + 4;
 
-	sprintf(log_buf, "%016lx:    ", old_pc);
-	for(int i = 0; i < 4; i++)
-		sprintf(log_buf + 21 + 3*i, "%02x ", *(((uint8_t*)&(s.inst.val)) + 3 - i));
+	pmp_check(pc, true, false);
+	uint32_t raw = (uint32_t)vaddr_ifetch(pc, 4);
+
+	/* Keep the legacy Decode struct in sync for monitor compatibility */
+	s.pc      = pc;
+	s.snpc    = snpc;
+	s.inst.val = raw;
+
+	IR_Inst ir;
+	ir_decode(raw, pc, snpc, &ir);
+	ir_execute(&ir, &cpu);
+	ir_writeback(&ir, &cpu);
+
+	cpu.pc   = ir.dnpc;
+	s.dnpc   = ir.dnpc;
+	s.snpc   = ir.dnpc;   /* mirrors old: s.snpc = s.dnpc */
+
+	/* ── Instruction trace (same format as before) ─────────────── */
+	sprintf(log_buf, "%016lx:    ", pc);
+	for (int i = 0; i < 4; i++)
+		sprintf(log_buf + 21 + 3 * i, "%02x ", *(((uint8_t *)&raw) + 3 - i));
 	sprintf(log_buf + 33, "   ");
-	disassemble(log_buf + 36, 70, old_pc, (uint8_t *)(&(s.inst.val)), 4);
+	disassemble(log_buf + 36, 70, pc, (uint8_t *)(&raw), 4);
 
-	if(g_print_step){
+	if (g_print_step)
 		printf("%s\n", log_buf);
-	}
 	log_write("%s\n", log_buf);
 
 	add_ringbuf_inst(log_buf);
-	/*********************************vga更新**************************************
-	 * 每个一段时间将vga屏幕上的信息进行更新										   *
-	 *****************************************************************************/
+
+	/*****************************vga更新***************************************
+	 * 每隔一段时间将vga屏幕上的信息进行更新                                         *
+	 **************************************************************************/
 #ifdef CONFIG_timer
 	static uint64_t last = 0;
 	uint64_t now = get_time();
-	if ((now - last) < 1000000 / 60) {
+	if ((now - last) < 1000000 / 60)
 		return;
-	}
 	last = now;
 #endif
 
 #ifdef CONFIG_gpu
-  	vga_update_screen();
+	vga_update_screen();
 #endif
 
-	/********************************事件******************************************
-	 * 用于将事件全部放入到一个环形队列中											   *
-	 *****************************************************************************/
+	/***************************事件********************************************
+	 * 用于将事件全部放入到一个环形队列中                                              *
+	 **************************************************************************/
 #ifdef CONFIG_keyboard
 	SDL_Event event;
-	while(SDL_PollEvent(&event)){
-		switch(event.type){
-			case SDL_QUIT:
-				state = NEMU_QUIT;
-				break;
-			case SDL_KEYDOWN:
-			case SDL_KEYUP:{
-				uint8_t k = event.key.keysym.scancode;
-				bool is_keydown = (event.key.type == SDL_KEYDOWN);
-				send_key(k, is_keydown);
-				break;
-				}
-			default: break;
+	while (SDL_PollEvent(&event)) {
+		switch (event.type) {
+		case SDL_QUIT:
+			state = NEMU_QUIT;
+			break;
+		case SDL_KEYDOWN:
+		case SDL_KEYUP: {
+			uint8_t k = event.key.keysym.scancode;
+			bool is_keydown = (event.key.type == SDL_KEYDOWN);
+			send_key(k, is_keydown);
+			break;
+		}
+		default:
+			break;
 		}
 	}
 #endif
 }
- 
+
 void exec(uint64_t n)
 {
 	g_print_step = (n < MAX_INST_TO_PRINT);
-	switch (state){
-		case NEMU_END: case NEMU_ABORT:
-			Log("Program execution has ended.\n");
-			return ;
-		default: state = NEMU_RUNNING;
+	switch (state) {
+	case NEMU_END:
+	case NEMU_ABORT:
+		Log("Program execution has ended.\n");
+		return;
+	default:
+		state = NEMU_RUNNING;
 	}
 
-	for(;n > 0;n--){
+	for (; n > 0; n--) {
 		exec_once();
-		if(check_wp() && state != NEMU_ABORT)
+		if (check_wp() && state != NEMU_ABORT)
 			state = NEMU_STOP;
-		if(state != NEMU_RUNNING) break;
+		if (state != NEMU_RUNNING)
+			break;
 	}
 
-	switch(state){
-		case NEMU_ABORT:
-		 	if(!status())
-				printf(ANSI_FMT("HIT GOOG TRAP\n",ANSI_FG_GREEN));
-			else
-				printf(ANSI_FMT("HIT BAD TRAP\n",ANSI_FG_RED));
+	switch (state) {
+	case NEMU_ABORT:
+		if (!status())
+			printf(ANSI_FMT("HIT GOOG TRAP\n", ANSI_FG_GREEN));
+		else
+			printf(ANSI_FMT("HIT BAD TRAP\n", ANSI_FG_RED));
 	}
 }
