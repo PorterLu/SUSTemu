@@ -90,6 +90,7 @@ static void ir_exec_ecall (IR_Inst *ir, CPU_state *cpu);
 static void ir_exec_mret  (IR_Inst *ir, CPU_state *cpu);
 static void ir_exec_ebreak(IR_Inst *ir, CPU_state *cpu);
 static void ir_exec_fence_i(IR_Inst *ir, CPU_state *cpu);
+static void ir_exec_fence  (IR_Inst *ir, CPU_state *cpu);
 static void ir_exec_inv   (IR_Inst *ir, CPU_state *cpu);
 
 /* ── ir_fill_operands ───────────────────────────────────────────────────── */
@@ -211,6 +212,18 @@ void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir)
     INSTPAT_START(ir);
 #include <inst_table.inc>
     INSTPAT_END(ir);
+
+    /*
+     * Set serializing=1 at decode time for instructions that must drain the
+     * ROB before entering (system calls, privilege transitions, fences).
+     * ooo_stage_rn() reads this flag before exec_fn is ever called, so it
+     * must be set here rather than inside the exec_fn.
+     */
+    if (ir->exec_fn == ir_exec_ecall  ||
+        ir->exec_fn == ir_exec_mret   ||
+        ir->exec_fn == ir_exec_ebreak ||
+        ir->exec_fn == ir_exec_fence)
+        ir->serializing = 1;
 }
 
 /* ── ir_execute ─────────────────────────────────────────────────────────── */
@@ -823,6 +836,28 @@ static void ir_exec_fence_i(IR_Inst *ir, CPU_state *cpu)
     ir->type   = ITYPE_FENCE;
     ir->result = 0;
     ir->dnpc   = ir->snpc;
+}
+
+static void ir_exec_fence(IR_Inst *ir, CPU_state *cpu)
+{
+    /*
+     * FENCE (data memory barrier).
+     *
+     * Correctness: vmem.c already uses eager write-invalidate snooping so all
+     * stores are globally visible at commit time — the SC ordering guarantee
+     * holds without any extra action here.
+     *
+     * OOO ordering: marking serializing=1 forces the OOO engine to drain the
+     * ROB before this instruction enters, ensuring all preceding stores have
+     * committed (and been snooped to other L1Ds) before any instruction after
+     * the FENCE can issue.
+     */
+    ir->type        = ITYPE_FENCE;
+    ir->serializing = 1;
+    ir->rd          = -1;
+    ir->result      = 0;
+    ir->dnpc        = ir->snpc;
+    (void)cpu;
 }
 
 static void ir_exec_inv(IR_Inst *ir, CPU_state *cpu)

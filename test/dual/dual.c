@@ -57,6 +57,12 @@ void dual_main(int hartid)
 
     unsigned long result = run_workload();
 
+    /* FENCE.RW: ensure the workload result is visible to all harts before
+     * writing the output slot.  In our eager-snoop SC model this is a NOP
+     * semantically, but it exercises the FENCE decode path and forces the
+     * OOO engine to drain the ROB first. */
+    __asm__ volatile("fence rw, rw");
+
     /* Store per-hart result to dedicated memory slot */
     volatile unsigned long *out =
         (volatile unsigned long *)(RESULT_BASE + hartid * 8);
