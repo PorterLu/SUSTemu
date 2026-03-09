@@ -9,7 +9,7 @@ typedef struct {
     int dirty;
     uint64_t tag;
     uint64_t last_access;
-    uint8_t data[BLOCK_SIZE]; 
+    uint8_t data[BLOCK_SIZE];
 } CacheLine;
 
 typedef struct {
@@ -33,9 +33,16 @@ extern Cache *L1I_cache;
 extern Cache *L1D_cache;
 extern Cache *L2_cache;
 
+Cache *init_cache(int s, int w, char *name);
 void cache_report(Cache *c);
 word_t cache_read(Cache *l1, Cache *l2, paddr_t addr, int len);
 void cache_write(Cache *l1, Cache *l2, paddr_t addr, int len, word_t data);
 void init_cache_system();
 
-#endif 
+/* ── Cache coherency (write-invalidate, used when g_num_cores > 1) ──────── */
+/* Invalidate any L1D line holding addr in another core's cache. */
+void cache_snoop_invalidate(Cache *other_l1d, paddr_t addr);
+/* Flush a dirty L1D line (write it back to L2) before another core reads. */
+void cache_snoop_flush_dirty(Cache *src_l1d, Cache *l2, paddr_t addr);
+
+#endif

@@ -64,6 +64,10 @@
 extern uint64_t g_sim_cycles;
 extern uint64_t g_sim_instret;
 
+/* Current hart index — updated by core_cycle() before dispatching.
+ * read_csr(MHARTID) returns this value. */
+extern int g_current_hartid;
+
 enum {
 	USER,
 	SUPERVISOR,

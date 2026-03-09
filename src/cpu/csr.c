@@ -7,6 +7,7 @@ CSR csr;
 uint64_t priv_level = 3;
 uint64_t g_sim_cycles  = 0;
 uint64_t g_sim_instret = 0;
+int      g_current_hartid = 0;
 uint8_t pmpcfg[PMP_NUMBER_IN_SUSTEMU];
 word_t pmpaddr[PMP_NUMBER_IN_SUSTEMU];
 uint8_t pmp_on_count = 0;
@@ -132,7 +133,7 @@ word_t read_csr(uint64_t no){
 		case MCAUSE: return csr.mcause;
 		case MTVEC: return csr.mtvec;
 		case MSTATUS: return csr.mstatus;
-		case MHARTID: return 0;
+		case MHARTID: return (word_t)g_current_hartid;
 		case MTVAL: return csr.mtval;
 		case MIP: return csr.mip;
 		case MIE: return csr.mie;

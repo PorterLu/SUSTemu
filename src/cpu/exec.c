@@ -1,4 +1,5 @@
 #include <exec.h>
+#include <core.h>
 #include <disasm.hpp>
 #include <state.h>
 #include <vmem.h>
@@ -127,8 +128,35 @@ void exec(uint64_t n)
 		state = NEMU_RUNNING;
 	}
 
-	if (g_ooo_mode) {
-		/* ── Out-of-order (Tomasulo) mode ──────────────────── */
+	if (g_num_cores > 1) {
+		/* ── Multi-core mode: use Core abstraction ───────────────────── */
+		/* Initialise each core's engine on first run */
+		static int cores_initialised = 0;
+		if (!cores_initialised) {
+			cores_initialised = 1;
+			for (int i = 0; i < g_num_cores; i++) {
+				Core *c = &cores[i];
+				if (c->mode == CORE_MODE_INORDER)
+					pipeline_init_core(c);
+				else if (c->mode == CORE_MODE_OOO)
+					ooo_init_core(c);
+			}
+		}
+
+		uint64_t total = 0;
+		while (total < n && state == NEMU_RUNNING) {
+			for (int i = 0; i < g_num_cores; i++) {
+				core_cycle(&cores[i]);
+				total++;
+				if (check_wp() && state != NEMU_ABORT)
+					state = NEMU_STOP;
+				if (state != NEMU_RUNNING) break;
+			}
+		}
+		for (int i = 0; i < g_num_cores; i++)
+			core_report(&cores[i]);
+	} else if (g_ooo_mode) {
+		/* ── Out-of-order (Tomasulo) mode ──────────────────────── */
 		ooo_init();
 		while (ooo_stats.insts < n && state == NEMU_RUNNING) {
 			ooo_cycle();
@@ -137,7 +165,7 @@ void exec(uint64_t n)
 		}
 		ooo_report();
 	} else if (g_inorder_mode) {
-		/* ── In-order pipeline mode ────────────────────────── */
+		/* ── In-order pipeline mode ────────────────────────────── */
 		pipeline_init();
 		while (pipe_stats.insts < n && state == NEMU_RUNNING) {
 			pipeline_cycle();

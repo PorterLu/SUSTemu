@@ -1,4 +1,4 @@
-.PHONY: all run clean menuconfig bench bench-functional bench-inorder bench-bpred bench-ooo bench-dhrystone
+.PHONY: all run clean menuconfig bench bench-functional bench-inorder bench-bpred bench-ooo bench-dhrystone bench-dual
 
 PWD = $(shell pwd)
 OBJ_DIR = $(PWD)/build
@@ -78,6 +78,11 @@ bench-dhrystone: all
 	./build/sustemu -b --inorder --bpred -e ./test/dhrystone/dhrystone.elf -l /dev/null ./test/dhrystone/dhrystone.bin
 	@echo "=== Dhrystone 2.1 — OOO engine + bpred ==="
 	./build/sustemu -b --ooo --bpred -e ./test/dhrystone/dhrystone.elf -l /dev/null ./test/dhrystone/dhrystone.bin
+
+bench-dual: all
+	make -C ./test/dual
+	@echo "=== Dual-core OOO + bpred — each hart runs independent Dhrystone ==="
+	./build/sustemu -b --ooo --bpred --dual -e ./test/dual/dual.elf -l /dev/null ./test/dual/dual.bin
 
 $(TARGET): $(OBJS)
 	@$(LD) -o $@ $(OBJS) $(LDFLAGS) $(LIBS) 
