@@ -114,9 +114,12 @@ static void ir_fill_operands(IR_Inst *ir, uint32_t i, int type)
     case TYPE_I:
         ir->src1_val = cpu.gpr[ir->rs1];
         ir->src2_val = immI(i);
+        ir->rs2      = -1;   /* rs2 field is part of imm for I-type, not a reg source */
         break;
     case TYPE_U:
         ir->src1_val = immU(i);
+        ir->rs1      = -1;
+        ir->rs2      = -1;
         break;
     case TYPE_S:
         ir->rd       = -1;           /* stores have no register destination */
@@ -126,6 +129,8 @@ static void ir_fill_operands(IR_Inst *ir, uint32_t i, int type)
         break;
     case TYPE_J:
         ir->src1_val = immJ(i);      /* jump offset                         */
+        ir->rs1      = -1;
+        ir->rs2      = -1;
         break;
     case TYPE_R:
         ir->src1_val = cpu.gpr[ir->rs1];
@@ -138,10 +143,14 @@ static void ir_fill_operands(IR_Inst *ir, uint32_t i, int type)
         ir->imm      = immB(i);      /* branch offset                        */
         break;
     case TYPE_N:
-        ir->rd = -1;
+        ir->rd  = -1;
+        ir->rs1 = -1;
+        ir->rs2 = -1;
         break;
     default:
-        ir->rd = -1;
+        ir->rd  = -1;
+        ir->rs1 = -1;
+        ir->rs2 = -1;
         break;
     }
 }
@@ -179,6 +188,9 @@ void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir)
     ir->src1_val        = 0;
     ir->src2_val        = 0;
     ir->imm             = 0;
+    ir->mem_addr        = 0;
+    ir->mem_width       = 0;
+    ir->mem_sign        = 0;
     ir->result          = 0;
     ir->dnpc            = snpc;   /* default: sequential */
     ir->taken           = 0;
@@ -214,6 +226,41 @@ void ir_writeback(IR_Inst *ir, CPU_state *cpu)
     if (ir->rd != -1)
         cpu->gpr[ir->rd] = ir->result;
     cpu->gpr[0] = 0;   /* x0 is always zero */
+}
+
+/* ── ir_mem_access ──────────────────────────────────────────────────────── */
+/*
+ * MEM stage: perform the actual memory read or write deferred from EX.
+ * For ITYPE_LOAD: reads mem_width bytes at mem_addr, applies sign/zero
+ *                 extension, and writes the result into ir->result.
+ * For ITYPE_STORE: writes src2_val to mem_addr with width mem_width.
+ * All other instruction types are no-ops.
+ */
+void ir_mem_access(IR_Inst *ir)
+{
+    if (ir->type == ITYPE_LOAD) {
+        word_t raw = vaddr_read(ir->mem_addr, ir->mem_width);
+        if (ir->mem_sign) {
+            /* Signed load: sign-extend to 64 bits */
+            switch (ir->mem_width) {
+            case 1: ir->result = SEXT(raw,  8); break;
+            case 2: ir->result = SEXT(raw, 16); break;
+            case 4: ir->result = SEXT(raw, 32); break;
+            default: ir->result = raw; break;   /* 8-byte: no extension */
+            }
+        } else {
+            /* Unsigned/full load: zero-extend to 64 bits */
+            switch (ir->mem_width) {
+            case 1: ir->result = UEXT(raw,  8); break;
+            case 2: ir->result = UEXT(raw, 16); break;
+            case 4: ir->result = UEXT(raw, 32); break;
+            default: ir->result = raw; break;   /* 8-byte: no extension */
+            }
+        }
+    } else if (ir->type == ITYPE_STORE) {
+        vaddr_write(ir->mem_addr, ir->mem_width, ir->src2_val);
+    }
+    /* ALU/branch/jump/system: nothing to do */
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -606,81 +653,99 @@ static void ir_exec_bgeu(IR_Inst *ir, CPU_state *cpu)
 
 static void ir_exec_ld(IR_Inst *ir, CPU_state *cpu)
 {
-    ir->type   = ITYPE_LOAD;
-    ir->result = vaddr_read(ir->src1_val + ir->src2_val, 8);
-    ir->dnpc   = ir->snpc;
+    ir->type      = ITYPE_LOAD;
+    ir->mem_addr  = ir->src1_val + ir->src2_val;
+    ir->mem_width = 8;
+    ir->mem_sign  = 0;   /* no extension needed for 64-bit load */
+    ir->dnpc      = ir->snpc;
 }
 
 static void ir_exec_lw(IR_Inst *ir, CPU_state *cpu)
 {
-    ir->type   = ITYPE_LOAD;
-    ir->result = SEXT(vaddr_read(ir->src1_val + ir->src2_val, 4), 32);
-    ir->dnpc   = ir->snpc;
+    ir->type      = ITYPE_LOAD;
+    ir->mem_addr  = ir->src1_val + ir->src2_val;
+    ir->mem_width = 4;
+    ir->mem_sign  = 1;   /* sign-extend 32→64 */
+    ir->dnpc      = ir->snpc;
 }
 
 static void ir_exec_lh(IR_Inst *ir, CPU_state *cpu)
 {
-    ir->type   = ITYPE_LOAD;
-    ir->result = SEXT(vaddr_read(ir->src1_val + ir->src2_val, 2), 16);
-    ir->dnpc   = ir->snpc;
+    ir->type      = ITYPE_LOAD;
+    ir->mem_addr  = ir->src1_val + ir->src2_val;
+    ir->mem_width = 2;
+    ir->mem_sign  = 1;
+    ir->dnpc      = ir->snpc;
 }
 
 static void ir_exec_lb(IR_Inst *ir, CPU_state *cpu)
 {
-    ir->type   = ITYPE_LOAD;
-    ir->result = SEXT(vaddr_read(ir->src1_val + ir->src2_val, 1), 8);
-    ir->dnpc   = ir->snpc;
+    ir->type      = ITYPE_LOAD;
+    ir->mem_addr  = ir->src1_val + ir->src2_val;
+    ir->mem_width = 1;
+    ir->mem_sign  = 1;
+    ir->dnpc      = ir->snpc;
 }
 
 static void ir_exec_lwu(IR_Inst *ir, CPU_state *cpu)
 {
-    ir->type   = ITYPE_LOAD;
-    ir->result = UEXT(vaddr_read(ir->src1_val + ir->src2_val, 4), 32);
-    ir->dnpc   = ir->snpc;
+    ir->type      = ITYPE_LOAD;
+    ir->mem_addr  = ir->src1_val + ir->src2_val;
+    ir->mem_width = 4;
+    ir->mem_sign  = 0;   /* zero-extend */
+    ir->dnpc      = ir->snpc;
 }
 
 static void ir_exec_lhu(IR_Inst *ir, CPU_state *cpu)
 {
-    ir->type   = ITYPE_LOAD;
-    ir->result = UEXT(vaddr_read(ir->src1_val + ir->src2_val, 2), 16);
-    ir->dnpc   = ir->snpc;
+    ir->type      = ITYPE_LOAD;
+    ir->mem_addr  = ir->src1_val + ir->src2_val;
+    ir->mem_width = 2;
+    ir->mem_sign  = 0;
+    ir->dnpc      = ir->snpc;
 }
 
 static void ir_exec_lbu(IR_Inst *ir, CPU_state *cpu)
 {
-    ir->type   = ITYPE_LOAD;
-    ir->result = UEXT(vaddr_read(ir->src1_val + ir->src2_val, 1), 8);
-    ir->dnpc   = ir->snpc;
+    ir->type      = ITYPE_LOAD;
+    ir->mem_addr  = ir->src1_val + ir->src2_val;
+    ir->mem_width = 1;
+    ir->mem_sign  = 0;
+    ir->dnpc      = ir->snpc;
 }
 
 /* ── Stores ──────────────────────────────────────────────── */
 
 static void ir_exec_sd(IR_Inst *ir, CPU_state *cpu)
 {
-    ir->type = ITYPE_STORE;
-    vaddr_write(ir->src1_val + ir->imm, 8, ir->src2_val);
-    ir->dnpc = ir->snpc;
+    ir->type      = ITYPE_STORE;
+    ir->mem_addr  = ir->src1_val + ir->imm;
+    ir->mem_width = 8;
+    ir->dnpc      = ir->snpc;
 }
 
 static void ir_exec_sw(IR_Inst *ir, CPU_state *cpu)
 {
-    ir->type = ITYPE_STORE;
-    vaddr_write(ir->src1_val + ir->imm, 4, ir->src2_val);
-    ir->dnpc = ir->snpc;
+    ir->type      = ITYPE_STORE;
+    ir->mem_addr  = ir->src1_val + ir->imm;
+    ir->mem_width = 4;
+    ir->dnpc      = ir->snpc;
 }
 
 static void ir_exec_sh(IR_Inst *ir, CPU_state *cpu)
 {
-    ir->type = ITYPE_STORE;
-    vaddr_write(ir->src1_val + ir->imm, 2, ir->src2_val);
-    ir->dnpc = ir->snpc;
+    ir->type      = ITYPE_STORE;
+    ir->mem_addr  = ir->src1_val + ir->imm;
+    ir->mem_width = 2;
+    ir->dnpc      = ir->snpc;
 }
 
 static void ir_exec_sb(IR_Inst *ir, CPU_state *cpu)
 {
-    ir->type = ITYPE_STORE;
-    vaddr_write(ir->src1_val + ir->imm, 1, ir->src2_val);
-    ir->dnpc = ir->snpc;
+    ir->type      = ITYPE_STORE;
+    ir->mem_addr  = ir->src1_val + ir->imm;
+    ir->mem_width = 1;
+    ir->dnpc      = ir->snpc;
 }
 
 /* ── CSR operations ──────────────────────────────────────── */
