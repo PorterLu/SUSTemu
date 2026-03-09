@@ -1,3 +1,11 @@
 /build
-./log.txt
-./modification.md
+log.txt
+modification.md
+.vscode/
+os_test/
+
+# Test build artifacts
+test/**/*.bin
+test/**/*.elf
+test/**/*.o
+test/**/*.d
