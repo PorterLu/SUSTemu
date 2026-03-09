@@ -26,6 +26,8 @@
 char* elf_file = NULL;
 
 extern int g_inorder_mode;  /* defined in exec.c */
+extern int g_bpred_mode;    /* defined in exec.c */
+extern int g_ooo_mode;      /* defined in ooo.c  */
 
 void halt()
 {
@@ -41,11 +43,13 @@ int parse_args(int argc, char *argv[])
 		{"log"	,	required_argument	, NULL, 'l'},
 		{"task"	, 	required_argument	, NULL, 't'},
 		{"inorder",	no_argument			, NULL, 'i'},
+		{"bpred",	no_argument			, NULL, 'p'},
+		{"ooo",		no_argument			, NULL, 'o'},
 		{0		, 	0					, NULL,  0 }
 	};
 
 	int o;
-	while((o=getopt_long(argc, argv, "-bs:e:l:t:i", table, NULL))!=-1)
+	while((o=getopt_long(argc, argv, "-bs:e:l:t:ipo", table, NULL))!=-1)
 	{
 		switch(o)
 		{
@@ -54,6 +58,8 @@ int parse_args(int argc, char *argv[])
 			case 'e': elf_file = optarg;break;
 			case 't': task_file = optarg; break;
 			case 'i': g_inorder_mode = 1; break;
+			case 'p': g_bpred_mode = 1; break;
+			case 'o': g_ooo_mode = 1; break;
 			case 1: img_file = optarg;return 0;
 		}
 	}

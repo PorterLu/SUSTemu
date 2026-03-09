@@ -73,6 +73,10 @@ typedef struct IR_Inst {
     /* ── Pipeline control flags (Phase 4+) ───────────────── */
     int         serializing; /* 1 = must drain ROB before issue (CSR/ecall/mret) */
 
+    /* ── Phase 4 OOO tracking (set by RN stage, carried through RS/latches) */
+    int         phys_rd;    /* Allocated physical destination register (-1 = none) */
+    int         rob_idx;    /* ROB slot assigned at RN stage (-1 = not assigned)   */
+
     /* ── Polymorphic executor ─────────────────────────────── */
     void (*exec_fn)(struct IR_Inst *, CPU_state *);
 } IR_Inst;

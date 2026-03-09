@@ -26,6 +26,7 @@
  */
 
 #include <pipeline.h>
+#include <bpred.h>
 #include <ir.h>
 #include <reg.h>
 #include <state.h>
@@ -60,6 +61,8 @@ void pipeline_init(void)
     pipe_stats.insts           = 0;
     pipe_stats.stall_load_use  = 0;
     pipe_stats.stall_control   = 0;
+
+    if (g_bpred_mode) bpred_init();
 }
 
 /* ── pipeline_cycle ─────────────────────────────────────────────────────── */
@@ -130,15 +133,29 @@ static void stage_EX(void)
         /* Propagate result into MEM latch */
         pipe.mem.ir = *ir;
 
-        /* ── Control hazard ─────────────────────────────────
-         * Any instruction whose resolved PC differs from pc+4 causes a
-         * control hazard: we need to flush the wrongly-fetched IF/ID
-         * pipeline stage (one instruction behind this one in flight).
-         */
-        if (ir->dnpc != ir->snpc) {
-            pipe.id.valid  = 0;   /* flush ID (wrongly-fetched instruction) */
-            pipe.fetch_pc  = ir->dnpc;
-            pipe_stats.stall_control++;
+        if (g_bpred_mode) {
+            /* ── Branch predictor update + misprediction recovery ────────
+             * bpred_update() records the actual outcome and updates all
+             * predictor structures.  A misprediction occurs when the
+             * resolved PC differs from whatever the IF stage predicted
+             * (bp_predicted_pc was set to snpc for non-taken predictions
+             * or to the BTB target for taken predictions).
+             */
+            bpred_update(ir);
+            if (ir->dnpc != ir->bp_predicted_pc) {
+                pipe.id.valid = 0;          /* flush wrongly-speculated IF/ID */
+                pipe.fetch_pc = ir->dnpc;   /* redirect to correct PC         */
+            }
+        } else {
+            /* ── Control hazard (no predictor) ──────────────────────────
+             * Any instruction whose resolved PC differs from pc+4 requires
+             * flushing the ID latch (one wrongly-fetched instruction).
+             */
+            if (ir->dnpc != ir->snpc) {
+                pipe.id.valid  = 0;
+                pipe.fetch_pc  = ir->dnpc;
+                pipe_stats.stall_control++;
+            }
         }
     }
 
@@ -215,10 +232,26 @@ static void stage_IF(void)
         return;
 
     /* Normal fetch: read instruction from memory and decode into ID latch */
-    uint32_t raw = (uint32_t)vaddr_ifetch(pipe.fetch_pc, 4);
-    ir_decode(raw, pipe.fetch_pc, pipe.fetch_pc + 4, &pipe.id.ir);
+    vaddr_t  pc  = pipe.fetch_pc;
+    uint32_t raw = (uint32_t)vaddr_ifetch(pc, 4);
+    ir_decode(raw, pc, pc + 4, &pipe.id.ir);
     pipe.id.valid  = 1;
-    pipe.fetch_pc += 4;   /* EX stage may overwrite this on a taken branch */
+    pipe.fetch_pc  = pc + 4;   /* default sequential; EX may override on mispredict */
+
+    if (g_bpred_mode) {
+        /* Query predictor and annotate the instruction for EX to verify */
+        BPredResult r = bpred_predict(pc);
+        pipe.id.ir.bp_predict_taken = r.taken;
+        pipe.id.ir.bp_predicted_pc  = (r.taken && r.btb_hit) ? r.target : pc + 4;
+        /* Speculative redirect: if we predict taken and have a BTB target,
+         * fetch from the predicted target next cycle. */
+        if (r.taken && r.btb_hit)
+            pipe.fetch_pc = r.target;
+    } else {
+        /* No predictor: always predict not-taken (pc+4) */
+        pipe.id.ir.bp_predict_taken = 0;
+        pipe.id.ir.bp_predicted_pc  = pc + 4;
+    }
 }
 
 /* ── pipeline_report ────────────────────────────────────────────────────── */
@@ -237,4 +270,6 @@ void pipeline_report(void)
     printf("Control flushes : %" PRIu64 " (x1 cycle = %" PRIu64 " cycles lost)\n",
            pipe_stats.stall_control, pipe_stats.stall_control);
     printf("===========================\n\n");
+
+    if (g_bpred_mode) bpred_report();
 }

@@ -16,9 +16,11 @@
 #include <csr.h>
 #include <ir.h>
 #include <pipeline.h>
+#include <ooo.h>
 
-static bool g_print_step = 1;
+static bool g_print_step = 0;
 int g_inorder_mode = 0;   /* set to 1 by --inorder command-line flag */
+int g_bpred_mode   = 0;   /* set to 1 by --bpred command-line flag   */
 extern void halt();
 char log_buf[128];
 
@@ -122,7 +124,16 @@ void exec(uint64_t n)
 		state = NEMU_RUNNING;
 	}
 
-	if (g_inorder_mode) {
+	if (g_ooo_mode) {
+		/* ── Out-of-order (Tomasulo) mode ──────────────────── */
+		ooo_init();
+		while (ooo_stats.insts < n && state == NEMU_RUNNING) {
+			ooo_cycle();
+			if (check_wp() && state != NEMU_ABORT)
+				state = NEMU_STOP;
+		}
+		ooo_report();
+	} else if (g_inorder_mode) {
 		/* ── In-order pipeline mode ────────────────────────── */
 		pipeline_init();
 		while (pipe_stats.insts < n && state == NEMU_RUNNING) {

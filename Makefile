@@ -1,4 +1,4 @@
-.PHONY: all run clean menuconfig
+.PHONY: all run clean menuconfig bench bench-functional bench-inorder bench-bpred bench-ooo
 
 PWD = $(shell pwd)
 OBJ_DIR = $(PWD)/build
@@ -40,7 +40,34 @@ all: $(TARGET)
 
 test: all 
 	make -C ./test
-	./build/sustemu -e ./test/kernel.elf -l log.txt ./test/kernel.bin
+	./build/sustemu -b -e ./test/kernel.elf -l log.txt ./test/kernel.bin
+
+bench: all
+	make -C ./test
+	@echo "=== Functional mode ==="
+	./build/sustemu -b -e ./test/kernel.elf ./test/kernel.bin
+	@echo "=== In-order pipeline (no branch predictor) ==="
+	./build/sustemu -b --inorder -e ./test/kernel.elf ./test/kernel.bin
+	@echo "=== In-order pipeline + BTB/Tournament branch predictor ==="
+	./build/sustemu -b --inorder --bpred -e ./test/kernel.elf ./test/kernel.bin
+	@echo "=== OOO engine (Tomasulo + ROB) + BTB/Tournament branch predictor ==="
+	./build/sustemu -b --ooo --bpred -e ./test/kernel.elf ./test/kernel.bin
+
+bench-functional: all
+	make -C ./test
+	./build/sustemu -b -e ./test/kernel.elf ./test/kernel.bin
+
+bench-inorder: all
+	make -C ./test
+	./build/sustemu -b --inorder -e ./test/kernel.elf ./test/kernel.bin
+
+bench-bpred: all
+	make -C ./test
+	./build/sustemu -b --inorder --bpred -e ./test/kernel.elf ./test/kernel.bin
+
+bench-ooo: all
+	make -C ./test
+	./build/sustemu -b --ooo --bpred -e ./test/kernel.elf ./test/kernel.bin
 
 $(TARGET): $(OBJS)
 	@$(LD) -o $@ $(OBJS) $(LDFLAGS) $(LIBS) 

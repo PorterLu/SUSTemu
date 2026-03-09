@@ -197,6 +197,8 @@ void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir)
     ir->bp_predict_taken = 0;
     ir->bp_predicted_pc  = 0;
     ir->serializing     = 0;
+    ir->phys_rd         = -1;
+    ir->rob_idx         = -1;
     ir->exec_fn         = ir_exec_inv;
 
     /* Pattern-match using the shared instruction table.
