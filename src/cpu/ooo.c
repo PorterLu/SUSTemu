@@ -25,6 +25,7 @@
 
 #include <ooo.h>
 #include <bpred.h>
+#include <csr.h>
 #include <reg.h>
 #include <state.h>
 #include <vmem.h>
@@ -571,6 +572,8 @@ void ooo_cycle(void)
     ooo_stage_id();
     ooo_stage_if();
     ooo_stats.cycles++;
+    g_sim_cycles++;
+    g_sim_instret = ooo_stats.insts;
 }
 
 /* ── ooo_report ──────────────────────────────────────────────────────────── */
