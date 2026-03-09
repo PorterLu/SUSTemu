@@ -66,13 +66,13 @@ typedef struct {
 } BPredResult;
 
 /* ── Globals ────────────────────────────────────────────────────────────── */
-extern BranchPredictor bpred;
-extern int g_bpred_mode;       /* set to 1 by --bpred command-line flag */
+extern BranchPredictor bpred;   /* single-core legacy instance */
+extern int g_bpred_mode;        /* set to 1 by --bpred command-line flag */
 
-/* ── API ────────────────────────────────────────────────────────────────── */
-void        bpred_init(void);
-BPredResult bpred_predict(vaddr_t pc);
-void        bpred_update(IR_Inst *ir);
-void        bpred_report(void);
+/* ── API (all functions take explicit BranchPredictor pointer) ──────────── */
+void        bpred_init   (BranchPredictor *bp);
+BPredResult bpred_predict(BranchPredictor *bp, vaddr_t pc);
+void        bpred_update (BranchPredictor *bp, IR_Inst *ir);
+void        bpred_report (BranchPredictor *bp);
 
 #endif /* __CPU_BPRED_H__ */

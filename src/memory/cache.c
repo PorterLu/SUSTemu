@@ -165,3 +165,58 @@ void init_cache_system() {
     L1D_cache = init_cache(6, 8, "L1-Data");        // 32KB
     L2_cache  = init_cache(8, 16, "L2-Unified");    // 256KB
 }
+
+/* ── Cache coherency helpers ─────────────────────────────────────────────── */
+
+/*
+ * cache_snoop_invalidate — invalidate the cache line holding addr in
+ * other_l1d.  Called after a write to addr by another core.
+ * If the line is dirty, it is written back to L2 first (write-invalidate).
+ */
+void cache_snoop_invalidate(Cache *other_l1d, paddr_t addr)
+{
+    if (!other_l1d) return;
+
+    uint64_t set_idx = (addr >> other_l1d->off) & ((1ULL << other_l1d->s) - 1);
+    uint64_t tag     = addr >> (other_l1d->s + other_l1d->off);
+    CacheSet *set    = &other_l1d->sets[set_idx];
+
+    for (int i = 0; i < other_l1d->w; i++) {
+        if (set->lines[i].valid && set->lines[i].tag == tag) {
+            if (set->lines[i].dirty) {
+                /* Write back dirty data to L2 before invalidating */
+                paddr_t block_paddr = addr & ~(paddr_t)(BLOCK_SIZE - 1);
+                access_l2(L2_cache, block_paddr, set->lines[i].data, true);
+                other_l1d->writebacks++;
+            }
+            set->lines[i].valid = 0;
+            set->lines[i].dirty = 0;
+            break;
+        }
+    }
+}
+
+/*
+ * cache_snoop_flush_dirty — if src_l1d has a dirty line for addr, flush it
+ * to L2 (but keep the line valid/clean).  Called before another core reads
+ * addr so it sees the latest value.
+ */
+void cache_snoop_flush_dirty(Cache *src_l1d, Cache *l2, paddr_t addr)
+{
+    if (!src_l1d) return;
+
+    uint64_t set_idx = (addr >> src_l1d->off) & ((1ULL << src_l1d->s) - 1);
+    uint64_t tag     = addr >> (src_l1d->s + src_l1d->off);
+    CacheSet *set    = &src_l1d->sets[set_idx];
+
+    for (int i = 0; i < src_l1d->w; i++) {
+        if (set->lines[i].valid && set->lines[i].tag == tag
+                && set->lines[i].dirty) {
+            paddr_t block_paddr = addr & ~(paddr_t)(BLOCK_SIZE - 1);
+            access_l2(l2, block_paddr, set->lines[i].data, true);
+            set->lines[i].dirty = 0;
+            src_l1d->writebacks++;
+            break;
+        }
+    }
+}

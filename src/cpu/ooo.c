@@ -24,6 +24,7 @@
  */
 
 #include <ooo.h>
+#include <core.h>
 #include <bpred.h>
 #include <csr.h>
 #include <reg.h>
@@ -188,7 +189,7 @@ void ooo_init(void)
 
     ooo.fetch_pc = cpu.pc;
 
-    if (g_bpred_mode) bpred_init();
+    if (g_bpred_mode) bpred_init(&bpred);
 }
 
 /* ── ooo_stage_commit ────────────────────────────────────────────────────── */
@@ -306,7 +307,7 @@ static void ooo_stage_ex(void)
         ir.type == ITYPE_JAL    ||
         ir.type == ITYPE_JALR) {
 
-        if (g_bpred_mode) bpred_update(&ir);
+        if (g_bpred_mode) bpred_update(&bpred, &ir);
 
         predicted = ir.bp_predicted_pc ? ir.bp_predicted_pc : ir.snpc;
         if (ir.dnpc != predicted) {
@@ -544,7 +545,7 @@ static void ooo_stage_if(void)
     ooo.fetch_pc = pc + 4;  /* Sequential default; EX may override on flush */
 
     if (g_bpred_mode) {
-        r = bpred_predict(pc);
+        r = bpred_predict(&bpred, pc);
         ooo.latch_if_id.ir.bp_predict_taken = r.taken;
         ooo.latch_if_id.ir.bp_predicted_pc  =
             (r.taken && r.btb_hit) ? r.target : pc + 4;
@@ -594,5 +595,70 @@ void ooo_report(void)
     printf("Serializing stalls  : %" PRIu64 "\n", ooo_stats.serializing_stalls);
     printf("=============================\n\n");
 
-    if (g_bpred_mode) bpred_report();
+    if (g_bpred_mode) bpred_report(&bpred);
+}
+
+/* ── Multi-core entry points ─────────────────────────────────────────────── */
+
+void ooo_init_core(Core *c)
+{
+    /* Save single-core globals */
+    OOOState  save_ooo       = ooo;
+    OOOStats  save_ooo_stats = ooo_stats;
+    BranchPredictor save_bp  = bpred;
+
+    /* Install this core's state */
+    ooo       = c->ooo;
+    ooo_stats = c->ooo_stats;
+    bpred     = c->bpred;
+
+    /* ooo_init() uses cpu.gpr (already loaded by core_cycle) */
+    ooo_init();
+
+    /* Save back */
+    c->ooo       = ooo;
+    c->ooo_stats = ooo_stats;
+    c->bpred     = bpred;
+
+    /* Restore single-core globals */
+    ooo       = save_ooo;
+    ooo_stats = save_ooo_stats;
+    bpred     = save_bp;
+}
+
+void ooo_cycle_core(Core *c)
+{
+    /* Save single-core globals */
+    OOOState  save_ooo       = ooo;
+    OOOStats  save_ooo_stats = ooo_stats;
+    BranchPredictor save_bp  = bpred;
+
+    /* Install this core's state */
+    ooo       = c->ooo;
+    ooo_stats = c->ooo_stats;
+    bpred     = c->bpred;
+
+    /* Run OOO stages */
+    ooo_stage_commit();
+    ooo_stage_mem();
+    ooo_stage_ex();
+    ooo_stage_is();
+    ooo_stage_rn();
+    ooo_stage_id();
+    ooo_stage_if();
+    ooo_stats.cycles++;
+    g_sim_cycles++;
+    c->sim_cycles = ooo_stats.cycles;
+    g_sim_instret = ooo_stats.insts;
+    c->sim_instret = ooo_stats.insts;
+
+    /* Save back */
+    c->ooo       = ooo;
+    c->ooo_stats = ooo_stats;
+    c->bpred     = bpred;
+
+    /* Restore single-core globals */
+    ooo       = save_ooo;
+    ooo_stats = save_ooo_stats;
+    bpred     = save_bp;
 }

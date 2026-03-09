@@ -26,6 +26,7 @@
  */
 
 #include <pipeline.h>
+#include <core.h>
 #include <bpred.h>
 #include <ir.h>
 #include <reg.h>
@@ -63,7 +64,7 @@ void pipeline_init(void)
     pipe_stats.stall_load_use  = 0;
     pipe_stats.stall_control   = 0;
 
-    if (g_bpred_mode) bpred_init();
+    if (g_bpred_mode) bpred_init(&bpred);
 }
 
 /* ── pipeline_cycle ─────────────────────────────────────────────────────── */
@@ -144,7 +145,7 @@ static void stage_EX(void)
              * (bp_predicted_pc was set to snpc for non-taken predictions
              * or to the BTB target for taken predictions).
              */
-            bpred_update(ir);
+            bpred_update(&bpred, ir);
             if (ir->dnpc != ir->bp_predicted_pc) {
                 pipe.id.valid = 0;          /* flush wrongly-speculated IF/ID */
                 pipe.fetch_pc = ir->dnpc;   /* redirect to correct PC         */
@@ -243,7 +244,7 @@ static void stage_IF(void)
 
     if (g_bpred_mode) {
         /* Query predictor and annotate the instruction for EX to verify */
-        BPredResult r = bpred_predict(pc);
+        BPredResult r = bpred_predict(&bpred, pc);
         pipe.id.ir.bp_predict_taken = r.taken;
         pipe.id.ir.bp_predicted_pc  = (r.taken && r.btb_hit) ? r.target : pc + 4;
         /* Speculative redirect: if we predict taken and have a BTB target,
@@ -274,5 +275,83 @@ void pipeline_report(void)
            pipe_stats.stall_control, pipe_stats.stall_control);
     printf("===========================\n\n");
 
-    if (g_bpred_mode) bpred_report();
+    if (g_bpred_mode) bpred_report(&bpred);
+}
+
+/* ── Multi-core entry points ─────────────────────────────────────────────── */
+/*
+ * pipeline_init_core — initialise this core's Pipeline/PipeStats,
+ * temporarily installing them as the globals so that pipeline_init()
+ * can reference cpu.pc.
+ */
+void pipeline_init_core(Core *c)
+{
+    /* Swap globals to this core's state */
+    Pipeline  save_pipe  = pipe;
+    PipeStats save_stats = pipe_stats;
+
+    pipe       = c->pipe;
+    pipe_stats = c->pipe_stats;
+
+    /* pipeline_init() reads cpu.pc (already loaded by core_cycle) */
+    /* Init latches and fetch_pc */
+    pipe.id.valid   = 0;
+    pipe.ex.valid   = 0;
+    pipe.mem.valid  = 0;
+    pipe.wb.valid   = 0;
+    pipe.fetch_pc   = cpu.pc;
+
+    pipe_stats.cycles          = 0;
+    pipe_stats.insts           = 0;
+    pipe_stats.stall_load_use  = 0;
+    pipe_stats.stall_control   = 0;
+
+    if (c->bpred_enabled) bpred_init(&c->bpred);
+
+    c->pipe       = pipe;
+    c->pipe_stats = pipe_stats;
+
+    pipe       = save_pipe;
+    pipe_stats = save_stats;
+}
+
+/*
+ * pipeline_cycle_core — advance this core's pipeline by one cycle.
+ * Saves/restores the single-core globals so the stage functions work
+ * without modification.
+ */
+void pipeline_cycle_core(Core *c)
+{
+    /* Install this core's state into the legacy globals */
+    Pipeline       save_pipe  = pipe;
+    PipeStats      save_stats = pipe_stats;
+    BranchPredictor save_bp   = bpred;
+
+    pipe       = c->pipe;
+    pipe_stats = c->pipe_stats;
+    bpred      = c->bpred;
+
+    /* Update caches used by vmem (core_cycle already set L1I/L1D) */
+
+    /* Run the 5 stages */
+    stage_WB();
+    stage_MEM();
+    stage_EX();
+    stage_ID();
+    stage_IF();
+    pipe_stats.cycles++;
+    g_sim_cycles++;
+    c->sim_cycles = pipe_stats.cycles;
+    g_sim_instret = pipe_stats.insts;
+    c->sim_instret = pipe_stats.insts;
+
+    /* Save back to core */
+    c->pipe       = pipe;
+    c->pipe_stats = pipe_stats;
+    c->bpred      = bpred;
+
+    /* Restore single-core globals */
+    pipe       = save_pipe;
+    pipe_stats = save_stats;
+    bpred      = save_bp;
 }

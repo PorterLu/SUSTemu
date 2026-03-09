@@ -22,6 +22,7 @@
 #include <decode.h>
 #include <flash.h>
 #include <cache.h>
+#include <core.h>
 
 char* elf_file = NULL;
 
@@ -35,6 +36,10 @@ void halt()
 	return;
 }
 
+/* Default mode flags — set by parse_args, used after init to create cores */
+static CoreMode g_default_mode   = CORE_MODE_FUNCTIONAL;
+static int      g_dual_flag      = 0;  /* --dual: enable 2-core simulation */
+
 int parse_args(int argc, char *argv[])
 {
 	const struct option table[] = {
@@ -45,11 +50,12 @@ int parse_args(int argc, char *argv[])
 		{"inorder",	no_argument			, NULL, 'i'},
 		{"bpred",	no_argument			, NULL, 'p'},
 		{"ooo",		no_argument			, NULL, 'o'},
+		{"dual",	no_argument			, NULL, 'd'},
 		{0		, 	0					, NULL,  0 }
 	};
 
 	int o;
-	while((o=getopt_long(argc, argv, "-bs:e:l:t:ipo", table, NULL))!=-1)
+	while((o=getopt_long(argc, argv, "-bs:e:l:t:ipod", table, NULL))!=-1)
 	{
 		switch(o)
 		{
@@ -57,9 +63,10 @@ int parse_args(int argc, char *argv[])
 			case 'l': log_file = optarg;break;
 			case 'e': elf_file = optarg;break;
 			case 't': task_file = optarg; break;
-			case 'i': g_inorder_mode = 1; break;
+			case 'i': g_inorder_mode = 1; g_default_mode = CORE_MODE_INORDER; break;
 			case 'p': g_bpred_mode = 1; break;
-			case 'o': g_ooo_mode = 1; break;
+			case 'o': g_ooo_mode = 1;   g_default_mode = CORE_MODE_OOO; break;
+			case 'd': g_dual_flag = 1; break;
 			case 1: img_file = optarg;return 0;
 		}
 	}
@@ -109,7 +116,13 @@ int main(int argc, char *argv[]){
 	init_i8042();
 #endif
 
+	/* Create core(s) after all init is done (init_regs sets cpu, load_img
+	 * sets memory, so architectural state is ready to snapshot). */
+	g_num_cores = g_dual_flag ? 2 : 1;
+	for (int i = 0; i < g_num_cores; i++)
+		core_create(i, g_default_mode, g_bpred_mode);
+
 	sdbloop();
 
 	return status();
-}	
+}
