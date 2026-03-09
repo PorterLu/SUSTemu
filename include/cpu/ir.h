@@ -56,7 +56,12 @@ typedef struct IR_Inst {
     word_t      src2_val;   /* R[rs2] or immediate (mirrors old src2)   */
     word_t      imm;        /* Branch offset or store offset             */
 
-    /* ── Execute results (filled by exec_fn) ─────────────── */
+    /* ── MEM stage fields (Phase 2, computed by exec_fn) ──── */
+    vaddr_t     mem_addr;   /* Effective address for load/store          */
+    int         mem_width;  /* Access width in bytes: 1/2/4/8            */
+    int         mem_sign;   /* 1=signed-extend (SEXT), 0=zero-extend     */
+
+    /* ── Execute results (filled by exec_fn / ir_mem_access) ─ */
     word_t      result;     /* ALU result or loaded memory value         */
     vaddr_t     dnpc;       /* Dynamic next PC after execution           */
     int         taken;      /* Branch: 1=taken, 0=not-taken              */
@@ -85,6 +90,7 @@ typedef struct IR_Inst {
  */
 void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir);
 void ir_execute(IR_Inst *ir, CPU_state *cpu);
+void ir_mem_access(IR_Inst *ir);
 void ir_writeback(IR_Inst *ir, CPU_state *cpu);
 
 #endif /* __CPU_IR_H__ */

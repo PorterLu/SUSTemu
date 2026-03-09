@@ -15,8 +15,10 @@
 #include <decode.h>
 #include <csr.h>
 #include <ir.h>
+#include <pipeline.h>
 
 static bool g_print_step = 1;
+int g_inorder_mode = 0;   /* set to 1 by --inorder command-line flag */
 extern void halt();
 char log_buf[128];
 
@@ -49,6 +51,7 @@ static void exec_once()
 	IR_Inst ir;
 	ir_decode(raw, pc, snpc, &ir);
 	ir_execute(&ir, &cpu);
+	ir_mem_access(&ir);    /* MEM stage: actual load/store */
 	ir_writeback(&ir, &cpu);
 
 	cpu.pc   = ir.dnpc;
@@ -119,12 +122,24 @@ void exec(uint64_t n)
 		state = NEMU_RUNNING;
 	}
 
-	for (; n > 0; n--) {
-		exec_once();
-		if (check_wp() && state != NEMU_ABORT)
-			state = NEMU_STOP;
-		if (state != NEMU_RUNNING)
-			break;
+	if (g_inorder_mode) {
+		/* ── In-order pipeline mode ────────────────────────── */
+		pipeline_init();
+		while (pipe_stats.insts < n && state == NEMU_RUNNING) {
+			pipeline_cycle();
+			if (check_wp() && state != NEMU_ABORT)
+				state = NEMU_STOP;
+		}
+		pipeline_report();
+	} else {
+		/* ── Functional simulation mode (default) ────────── */
+		for (; n > 0; n--) {
+			exec_once();
+			if (check_wp() && state != NEMU_ABORT)
+				state = NEMU_STOP;
+			if (state != NEMU_RUNNING)
+				break;
+		}
 	}
 
 	switch (state) {

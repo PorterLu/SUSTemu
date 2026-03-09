@@ -25,6 +25,8 @@
 
 char* elf_file = NULL;
 
+extern int g_inorder_mode;  /* defined in exec.c */
+
 void halt()
 {
 	state = NEMU_ABORT;
@@ -38,18 +40,20 @@ int parse_args(int argc, char *argv[])
 		{"elf"	,	required_argument	, NULL, 'e'},
 		{"log"	,	required_argument	, NULL, 'l'},
 		{"task"	, 	required_argument	, NULL, 't'},
+		{"inorder",	no_argument			, NULL, 'i'},
 		{0		, 	0					, NULL,  0 }
 	};
-	
+
 	int o;
-	while((o=getopt_long(argc, argv, "-bs:e:l:t:", table, NULL))!=-1)
+	while((o=getopt_long(argc, argv, "-bs:e:l:t:i", table, NULL))!=-1)
 	{
 		switch(o)
 		{
-			case 'b': set_batch_mode(); break;		
+			case 'b': set_batch_mode(); break;
 			case 'l': log_file = optarg;break;
 			case 'e': elf_file = optarg;break;
 			case 't': task_file = optarg; break;
+			case 'i': g_inorder_mode = 1; break;
 			case 1: img_file = optarg;return 0;
 		}
 	}
