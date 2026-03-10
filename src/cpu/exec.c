@@ -18,6 +18,7 @@
 #include <ir.h>
 #include <pipeline.h>
 #include <ooo.h>
+#include <cache.h>
 
 static bool g_print_step = 0;
 int g_inorder_mode = 0;   /* set to 1 by --inorder command-line flag */
@@ -191,4 +192,21 @@ void exec(uint64_t n)
 		else
 			printf(ANSI_FMT("HIT BAD TRAP\n", ANSI_FG_RED));
 	}
+
+	/* ── Cache statistics ────────────────────────────────────────── */
+	printf("\n=== Cache Statistics ===\n");
+	if (g_num_cores > 1) {
+		for (int i = 0; i < g_num_cores; i++) {
+			printf("  Core %d:\n", i);
+			cache_report(cores[i].l1i);
+			cache_report(cores[i].l1d);
+		}
+		printf("  Shared:\n");
+		cache_report(L2_cache);
+	} else {
+		cache_report(L1I_cache);
+		cache_report(L1D_cache);
+		cache_report(L2_cache);
+	}
+	printf("========================\n\n");
 }

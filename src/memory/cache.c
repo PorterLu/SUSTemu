@@ -155,9 +155,12 @@ void cache_write(Cache *l1, Cache *l2, paddr_t addr, int len, word_t data) {
 
 // 打印报告
 void cache_report(Cache *c) {
-    double rate = (c->hits + c->misses == 0) ? 0 : (double)c->misses / (c->hits + c->misses) * 100;
-    printf("[%16s] Hits:%16ld Misses:%16ld Evict:%16ld WB:%ld MissRate:%16.2f%%\n",
-           c->name, c->hits, c->misses, c->evictions, c->writebacks, rate);
+    long total = c->hits + c->misses;
+    double hit_rate  = (total == 0) ? 0.0 : (double)c->hits  / total * 100.0;
+    double miss_rate = (total == 0) ? 0.0 : (double)c->misses / total * 100.0;
+    printf("  [%-16s] accesses: %8ld  hits: %8ld (%6.2f%%)  misses: %8ld (%6.2f%%)  evict: %6ld  wb: %6ld\n",
+           c->name, total, c->hits, hit_rate, c->misses, miss_rate,
+           c->evictions, c->writebacks);
 }
 
 void init_cache_system() {
