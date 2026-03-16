@@ -61,18 +61,26 @@ static void matmul_reorder(void)
 
 /* ── report helper ───────────────────────────────────────────────────────── */
 
-static void report(const char *label, uint64_t h0, uint64_t m0)
+static void report(const char *label, uint64_t h0, uint64_t m0,
+                                      uint64_t lh0, uint64_t lm0)
 {
     uint64_t hits   = rdl1d_hits()   - h0;
     uint64_t misses = rdl1d_misses() - m0;
     uint64_t total  = hits + misses;
     uint64_t pct    = total ? hits * 100 / total : 0;
 
+    uint64_t l2hits   = rdl2_hits()   - lh0;
+    uint64_t l2misses = rdl2_misses() - lm0;
+    uint64_t l2total  = l2hits + l2misses;
+    uint64_t l2pct    = l2total ? l2hits * 100 / l2total : 0;
+
     uart_puts(label);
-    uart_puts(": hits="); uart_put_uint(hits);
-    uart_puts("  misses="); uart_put_uint(misses);
-    uart_puts("  hit%="); uart_put_uint(pct);
-    uart_puts("%\r\n");
+    uart_puts(": L1D hits="); uart_put_uint(hits);
+    uart_puts("  misses=");   uart_put_uint(misses);
+    uart_puts("  hit%=");     uart_put_uint(pct);     uart_puts("%");
+    uart_puts("  |  L2 hits="); uart_put_uint(l2hits);
+    uart_puts("  misses=");     uart_put_uint(l2misses);
+    uart_puts("  hit%=");       uart_put_uint(l2pct);   uart_puts("%\r\n");
 }
 
 /* ── main ────────────────────────────────────────────────────────────────── */
@@ -86,10 +94,13 @@ int main(void)
 
     init();
 
+    uint64_t lh0, lm0;
+
     /* ijk */
     h0 = rdl1d_hits(); m0 = rdl1d_misses();
+    lh0 = rdl2_hits(); lm0 = rdl2_misses();
     matmul_ijk();
-    report("ijk", h0, m0);
+    report("ijk", h0, m0, lh0, lm0);
 
     /* clear C */
     for (i = 0; i < N; i++)
@@ -98,8 +109,9 @@ int main(void)
 
     /* ikj */
     h0 = rdl1d_hits(); m0 = rdl1d_misses();
+    lh0 = rdl2_hits(); lm0 = rdl2_misses();
     matmul_reorder();
-    report("ikj", h0, m0);
+    report("reorder", h0, m0, lh0, lm0);
 
     uart_puts("=========================================\r\n");
     return 0;

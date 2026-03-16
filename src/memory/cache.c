@@ -103,6 +103,7 @@ static void access_l2(Cache *l2, paddr_t addr, uint8_t *data, bool is_write) {
         }
         l2_line->valid = 1;
         l2_line->tag = addr >> (l2->s + l2->off);
+        l2_line->last_access = l2->timer;
     }
 }
 
