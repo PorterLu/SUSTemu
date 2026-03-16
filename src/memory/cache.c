@@ -1,5 +1,6 @@
 #include "cache.h"
 #include "pmem.h"
+#include "prefetch.h"
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -127,12 +128,47 @@ static void fetch_block(Cache *l1, Cache *l2, paddr_t addr, CacheLine *l1_victim
     l1_victim->last_access = l1->timer;
 }
 
+// 静默查找：不更新 hits/misses/timer，仅用于预取决策
+static CacheLine* find_line_quiet(Cache *c, paddr_t addr, int *is_hit) {
+    uint64_t set_idx = (addr >> c->off) & ((1ULL << c->s) - 1);
+    uint64_t tag = addr >> (c->s + c->off);
+    CacheSet *set = &c->sets[set_idx];
+    int lru_idx = 0;
+    uint64_t min_time = UINT64_MAX;
+    for (int i = 0; i < c->w; i++) {
+        if (set->lines[i].valid && set->lines[i].tag == tag) {
+            *is_hit = 1;
+            return &set->lines[i];
+        }
+        if (set->lines[i].last_access < min_time) {
+            min_time = set->lines[i].last_access;
+            lru_idx = i;
+        }
+    }
+    *is_hit = 0;
+    return &set->lines[lru_idx];
+}
+
+void cache_prefetch(Cache *l1, Cache *l2, paddr_t miss_addr) {
+    paddr_t cur = miss_addr;
+    for (int i = 0; i < PREFETCH_DEGREE; i++) {
+        paddr_t hint = prefetch_hint(cur);
+        if (hint == 0) break;
+        int already;
+        CacheLine *v = find_line_quiet(l1, hint, &already);
+        if (!already)
+            fetch_block(l1, l2, hint, v);
+        cur = hint;
+    }
+}
+
 
 word_t cache_read(Cache *l1, Cache *l2, paddr_t addr, int len) {
     int hit;
     CacheLine *line = find_line(l1, addr, &hit);
     if (!hit) {
         fetch_block(l1, l2, addr, line);
+        cache_prefetch(l1, l2, addr);
     }
     
     word_t res = 0;
@@ -146,6 +182,7 @@ void cache_write(Cache *l1, Cache *l2, paddr_t addr, int len, word_t data) {
     CacheLine *line = find_line(l1, addr, &hit);
     if (!hit) {
         fetch_block(l1, l2, addr, line);
+        cache_prefetch(l1, l2, addr);
     }
 
     uint32_t offset = addr & (BLOCK_SIZE - 1);
@@ -165,7 +202,7 @@ void cache_report(Cache *c) {
 
 void init_cache_system() {
     L1I_cache = init_cache(6, 8, "L1-Instruction"); // 32KB
-    L1D_cache = init_cache(6, 8, "L1-Data");        // 32KB
+    L1D_cache = init_cache(L1D_S, 8, "L1-Data");
     L2_cache  = init_cache(8, 16, "L2-Unified");    // 256KB
 }
 

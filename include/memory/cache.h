@@ -4,6 +4,11 @@
 
 #define BLOCK_SIZE 64      // 64字节块大小
 #define WORD_SIZE  8       // 每次访存单位（word_t）
+
+/* Lab Q1 ── edit L1D_S, then `make` from repo root to rebuild.
+ * s=3→4KB  s=4→8KB  s=5→16KB  s=6→32KB(default)  s=7→64KB  s=8→128KB
+ * Formula: 2^s sets × 8 ways × 64 B/block */
+#define L1D_S 6
 typedef struct {
     int valid;
     int dirty;
@@ -38,6 +43,9 @@ void cache_report(Cache *c);
 word_t cache_read(Cache *l1, Cache *l2, paddr_t addr, int len);
 void cache_write(Cache *l1, Cache *l2, paddr_t addr, int len, word_t data);
 void init_cache_system();
+
+#define PREFETCH_DEGREE 2
+void cache_prefetch(Cache *l1, Cache *l2, paddr_t miss_addr);
 
 /* ── Cache coherency (write-invalidate, used when g_num_cores > 1) ──────── */
 /* Invalidate any L1D line holding addr in another core's cache. */

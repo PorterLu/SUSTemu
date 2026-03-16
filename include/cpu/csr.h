@@ -59,6 +59,14 @@
 #define CYCLE    0xc00   /* rdcycle — cycles executed by this hart */
 #define INSTRET  0xc02   /* rdinstret — instructions retired */
 
+/* Custom HPM counters: cache hit/miss stats (hpmcounter3..8, 0xC03-0xC08) */
+#define L1D_HITS    0xc03
+#define L1D_MISSES  0xc04
+#define L1I_HITS    0xc05
+#define L1I_MISSES  0xc06
+#define L2_HITS     0xc07
+#define L2_MISSES   0xc08
+
 /* Global simulation cycle counter (bumped each pipeline/OOO cycle, or each
  * instruction in functional mode).  Exposed via CYCLE CSR. */
 extern uint64_t g_sim_cycles;

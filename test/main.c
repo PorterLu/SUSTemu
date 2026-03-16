@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include "csr_perf.h"
 
 // 串口输出地址
 #define UART_THR_ADDR 0xa00003f8
@@ -26,6 +27,15 @@ void uart_put_hex(uint64_t val) {
     }
 }
 
+void uart_put_dec(long val) {
+    if (val < 0) { uart_putc('-'); val = -val; }
+    if (val == 0) { uart_putc('0'); return; }
+    char buf[20];
+    int n = 0;
+    while (val) { buf[n++] = '0' + (val % 10); val /= 10; }
+    for (int i = n - 1; i >= 0; i--) uart_putc(buf[i]);
+}
+
 // --- 性能测试模块 ---
 
 void test_performance() {
@@ -33,10 +43,21 @@ void test_performance() {
 
     // 1. 读写性能测试 (Memory Read/Write)
     uart_puts("\r\n--- Testing R/W Performance ---\r\n");
+
+    long d_hits_start   = rdl1d_hits();
+    long d_misses_start = rdl1d_misses();
+
     for (int i = 0; i < TEST_SIZE; i++) {
         data_buffer[i] = i; // 写
         temp = data_buffer[i]; // 读
     }
+
+    long d_hits   = rdl1d_hits()   - d_hits_start;
+    long d_misses = rdl1d_misses() - d_misses_start;
+
+    uart_puts("L1D hits in R/W loop:   "); uart_put_dec(d_hits);   uart_puts("\r\n");
+    uart_puts("L1D misses in R/W loop: "); uart_put_dec(d_misses); uart_puts("\r\n");
+    uart_puts("L1D total accesses:     "); uart_put_dec(d_hits + d_misses); uart_puts("\r\n");
 
     // 2. 计算性能测试 (Computation - 简单的算术迭代)
     uart_puts("\r\n--- Testing Calc Performance ---\r\n");
@@ -54,7 +75,7 @@ void test_performance() {
 
 int main() {
     uart_puts("RISC-V Bare-metal Performance Test Initializing...\r\n");
-    
+
     test_performance();
 
     return 0;

@@ -2,6 +2,7 @@
 #include <debug.h>
 #include <state.h>
 #include <utils.h>
+#include <memory/cache.h>
 
 CSR csr;
 uint64_t priv_level = 3;
@@ -50,8 +51,14 @@ uint32_t csr_table[][4] = {
 	{PMPADDR6, MACHINE, true, true},
 	{PMPADDR8, MACHINE, true, true},
 	/* Performance counters — readable from all privilege levels */
-	{CYCLE,   USER, true, false},
-	{INSTRET, USER, true, false},
+	{CYCLE,      USER, true, false},
+	{INSTRET,    USER, true, false},
+	{L1D_HITS,   USER, true, false},
+	{L1D_MISSES, USER, true, false},
+	{L1I_HITS,   USER, true, false},
+	{L1I_MISSES, USER, true, false},
+	{L2_HITS,    USER, true, false},
+	{L2_MISSES,  USER, true, false},
 };
 
 void mret_priv_transfer(){
@@ -158,8 +165,14 @@ word_t read_csr(uint64_t no){
 		}
 		case PMPADDR0: return pmpaddr[0];
 		case PMPADDR2: return pmpaddr[1];
-		case CYCLE:   return g_sim_cycles;
-		case INSTRET: return g_sim_instret;
+		case CYCLE:      return g_sim_cycles;
+		case INSTRET:    return g_sim_instret;
+		case L1D_HITS:   return L1D_cache ? (word_t)L1D_cache->hits   : 0;
+		case L1D_MISSES: return L1D_cache ? (word_t)L1D_cache->misses : 0;
+		case L1I_HITS:   return L1I_cache ? (word_t)L1I_cache->hits   : 0;
+		case L1I_MISSES: return L1I_cache ? (word_t)L1I_cache->misses : 0;
+		case L2_HITS:    return L2_cache  ? (word_t)L2_cache->hits    : 0;
+		case L2_MISSES:  return L2_cache  ? (word_t)L2_cache->misses  : 0;
 	}
 	Assert(0, "unknown no:%lx\n", no);
 }

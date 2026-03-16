@@ -56,7 +56,7 @@ void core_create(int core_id, CoreMode mode, int bpred_enabled)
 
     /* Allocate per-core L1 caches; L2 is shared and already allocated. */
     c->l1i = init_cache(6, 8, "L1I");
-    c->l1d = init_cache(6, 8, "L1D");
+    c->l1d = init_cache(L1D_S, 8, "L1D");
 
     if (bpred_enabled)
         bpred_init(&c->bpred);
