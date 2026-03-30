@@ -72,10 +72,14 @@ typedef struct IR_Inst {
 
     /* ── Pipeline control flags (Phase 4+) ───────────────── */
     int         serializing; /* 1 = must drain ROB before issue (CSR/ecall/mret) */
+    int         fault;       /* 1 = invalid instruction fault (deferred to commit) */
 
     /* ── Phase 4 OOO tracking (set by RN stage, carried through RS/latches) */
     int         phys_rd;    /* Allocated physical destination register (-1 = none) */
     int         rob_idx;    /* ROB slot assigned at RN stage (-1 = not assigned)   */
+
+    /* ── Multi-cycle execution state (OOO EX/MEM stages) ──── */
+    int         cycles_rem; /* Countdown to completion; 0 = result ready    */
 
     /* ── Polymorphic executor ─────────────────────────────── */
     void (*exec_fn)(struct IR_Inst *, CPU_state *);
@@ -94,7 +98,7 @@ typedef struct IR_Inst {
  */
 void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir);
 void ir_execute(IR_Inst *ir, CPU_state *cpu);
-void ir_mem_access(IR_Inst *ir);
+void ir_mem_access(IR_Inst *ir, int *out_lat);
 void ir_writeback(IR_Inst *ir, CPU_state *cpu);
 
 #endif /* __CPU_IR_H__ */

@@ -37,6 +37,7 @@
 #include <decode.h>
 #include <inttypes.h>
 #include <csr.h>
+#include <exec_cfg.h>
 
 /* ── Global pipeline state ──────────────────────────────────────────────── */
 Pipeline  pipe;
@@ -48,6 +49,7 @@ static void stage_MEM(void);
 static void stage_EX(void);
 static void stage_ID(void);
 static void stage_IF(void);
+static void pipeline_trace_cycle(void);
 
 /* ── pipeline_init ──────────────────────────────────────────────────────── */
 
@@ -58,11 +60,13 @@ void pipeline_init(void)
     pipe.mem.valid  = 0;
     pipe.wb.valid   = 0;
     pipe.fetch_pc   = cpu.pc;
+    pipe.mem_stall_rem = 0;
 
     pipe_stats.cycles          = 0;
     pipe_stats.insts           = 0;
     pipe_stats.stall_load_use  = 0;
     pipe_stats.stall_control   = 0;
+    pipe_stats.stall_cache_miss = 0;
 
     if (g_bpred_mode) bpred_init(&bpred);
 }
@@ -72,9 +76,21 @@ void pipeline_init(void)
  * Advance every stage by one clock.  Stages run in reverse pipeline order
  * (WB first, IF last) so that each stage sees the latch values written by
  * the *previous* cycle's upstream stage, not the current cycle's.
+ *
+ * When a cache miss is detected in stage_MEM, pipe.mem_stall_rem is set to
+ * the remaining wait cycles.  For those cycles the pipeline is fully frozen
+ * (no stage runs) — the completed load sits in the WB latch until the stall
+ * expires, at which point stage_WB retires it normally.
  */
 void pipeline_cycle(void)
 {
+    if (pipe.mem_stall_rem > 0) {
+        pipe.mem_stall_rem--;
+        pipe_stats.cycles++;
+        g_sim_cycles++;
+        pipeline_trace_cycle();
+        return;
+    }
     stage_WB();
     stage_MEM();
     stage_EX();
@@ -83,6 +99,7 @@ void pipeline_cycle(void)
     pipe_stats.cycles++;
     g_sim_cycles++;
     g_sim_instret = pipe_stats.insts;
+    pipeline_trace_cycle();
 }
 
 /* ── stage_WB ───────────────────────────────────────────────────────────── */
@@ -111,13 +128,20 @@ static void stage_MEM(void)
     /* Transfer EX→MEM latch into WB latch before processing MEM */
     pipe.wb = pipe.mem;
 
-    if (pipe.mem.valid)
-        ir_mem_access(&pipe.mem.ir);   /* fills ir->result for loads */
-
-    /* Copy the (possibly updated) result into the WB latch.
-     * pipe.wb was set above before ir_mem_access(), so copy result now. */
-    if (pipe.mem.valid)
+    if (pipe.mem.valid) {
+        int lat = 0;
+        ir_mem_access(&pipe.mem.ir, &lat);   /* fills ir->result for loads */
+        /* Copy the result (may be a loaded value) into the WB latch */
         pipe.wb.ir.result = pipe.mem.ir.result;
+
+        /* If this is a load that missed the L1, stall the pipeline for the
+         * remaining cache latency.  The WB latch is already populated with
+         * the correct result; it will be committed after the stall expires. */
+        if (lat > 1 && pipe.mem.ir.type == ITYPE_LOAD) {
+            pipe.mem_stall_rem = lat - 1;
+            pipe_stats.stall_cache_miss += (uint64_t)(lat - 1);
+        }
+    }
 
     pipe.mem.valid = 0;
 }
@@ -133,6 +157,7 @@ static void stage_EX(void)
         IR_Inst *ir = &pipe.ex.ir;
 
         ir_execute(ir, &cpu);   /* ALU + address compute (no mem access) */
+        if (ir->fault) INV(ir->pc);  /* in-order: raise invalid-instruction immediately */
 
         /* Propagate result into MEM latch */
         pipe.mem.ir = *ir;
@@ -258,6 +283,46 @@ static void stage_IF(void)
     }
 }
 
+/* ── pipeline_trace_cycle ────────────────────────────────────────────────── */
+/*
+ * Print a one-line per-cycle pipeline snapshot to the log file.
+ * Enabled by --trace (g_trace_en=1); requires -l <file> to set log_fp.
+ *
+ * Format:
+ *   [C= N] ID:pc/name   EX:pc/name   MEM:pc/name   WB:pc/name
+ *
+ * Labels reflect the state AT THE END of the cycle (what each latch holds
+ * going into the next cycle):
+ *   ID  = just fetched by IF, awaiting decode
+ *   EX  = just decoded by ID, awaiting execution
+ *   MEM = just executed by EX, awaiting memory access
+ *   WB  = just memory-accessed, awaiting writeback
+ */
+static void pipeline_trace_cycle(void)
+{
+    if (!g_trace_en || !log_fp) return;
+
+#define TP(label, reg) do {                                          \
+    fprintf(log_fp, " %s:", label);                                  \
+    if ((reg).valid)                                                  \
+        fprintf(log_fp, "%08x/%-4s  ",                              \
+                (unsigned)(reg).ir.pc,                               \
+                (reg).ir.name ? (reg).ir.name : "??");               \
+    else                                                              \
+        fprintf(log_fp, "--            ");                           \
+} while (0)
+
+    fprintf(log_fp, "[C=%6" PRIu64 "]", pipe_stats.cycles);
+    TP("ID",  pipe.id);
+    TP("EX",  pipe.ex);
+    TP("MEM", pipe.mem);
+    TP("WB",  pipe.wb);
+    fprintf(log_fp, "\n");
+    fflush(log_fp);
+
+#undef TP
+}
+
 /* ── pipeline_report ────────────────────────────────────────────────────── */
 
 void pipeline_report(void)
@@ -273,6 +338,7 @@ void pipeline_report(void)
     printf("Load-use stalls : %" PRIu64 " cycles\n", pipe_stats.stall_load_use);
     printf("Control flushes : %" PRIu64 " (x1 cycle = %" PRIu64 " cycles lost)\n",
            pipe_stats.stall_control, pipe_stats.stall_control);
+    printf("Cache miss stalls: %" PRIu64 " cycles\n", pipe_stats.stall_cache_miss);
     printf("===========================\n\n");
 
     if (g_bpred_mode) bpred_report(&bpred);
@@ -300,11 +366,13 @@ void pipeline_init_core(Core *c)
     pipe.mem.valid  = 0;
     pipe.wb.valid   = 0;
     pipe.fetch_pc   = cpu.pc;
+    pipe.mem_stall_rem = 0;
 
     pipe_stats.cycles          = 0;
     pipe_stats.insts           = 0;
     pipe_stats.stall_load_use  = 0;
     pipe_stats.stall_control   = 0;
+    pipe_stats.stall_cache_miss = 0;
 
     if (c->bpred_enabled) bpred_init(&c->bpred);
 
@@ -333,12 +401,16 @@ void pipeline_cycle_core(Core *c)
 
     /* Update caches used by vmem (core_cycle already set L1I/L1D) */
 
-    /* Run the 5 stages */
-    stage_WB();
-    stage_MEM();
-    stage_EX();
-    stage_ID();
-    stage_IF();
+    /* Run the 5 stages (with cache-miss stall support) */
+    if (pipe.mem_stall_rem > 0) {
+        pipe.mem_stall_rem--;
+    } else {
+        stage_WB();
+        stage_MEM();
+        stage_EX();
+        stage_ID();
+        stage_IF();
+    }
     pipe_stats.cycles++;
     g_sim_cycles++;
     c->sim_cycles = pipe_stats.cycles;

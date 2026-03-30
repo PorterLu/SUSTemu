@@ -21,6 +21,7 @@
 #include <vmem.h>
 #include <state.h>
 #include <elftl.h>
+#include <exec_cfg.h>
 
 /* ── Forward declarations of per-instruction executor functions ─────────── */
 
@@ -198,6 +199,7 @@ void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir)
     ir->bp_predict_taken = 0;
     ir->bp_predicted_pc  = 0;
     ir->serializing     = 0;
+    ir->fault           = 0;
     ir->phys_rd         = -1;
     ir->rob_idx         = -1;
     ir->exec_fn         = ir_exec_inv;
@@ -251,10 +253,18 @@ void ir_writeback(IR_Inst *ir, CPU_state *cpu)
  * For ITYPE_STORE: writes src2_val to mem_addr with width mem_width.
  * All other instruction types are no-ops.
  */
-void ir_mem_access(IR_Inst *ir)
+void ir_mem_access(IR_Inst *ir, int *out_lat)
 {
     if (ir->type == ITYPE_LOAD) {
-        word_t raw = vaddr_read(ir->mem_addr, ir->mem_width);
+        word_t raw;
+        if (out_lat) {
+            /* OOO mode: probe cache level for pipeline latency accounting */
+            static const int level_to_lat[3] = { LAT_L1_HIT, LAT_L2_HIT, LAT_DRAM };
+            int level = vaddr_read_level(ir->mem_addr, ir->mem_width, &raw);
+            *out_lat = level_to_lat[level];
+        } else {
+            raw = vaddr_read(ir->mem_addr, ir->mem_width);
+        }
         if (ir->mem_sign) {
             /* Signed load: sign-extend to 64 bits */
             switch (ir->mem_width) {
@@ -274,6 +284,9 @@ void ir_mem_access(IR_Inst *ir)
         }
     } else if (ir->type == ITYPE_STORE) {
         vaddr_write(ir->mem_addr, ir->mem_width, ir->src2_val);
+        if (out_lat) *out_lat = LAT_L1_HIT;   /* Stores: assume L1 hit for now */
+    } else {
+        if (out_lat) *out_lat = 0;
     }
     /* ALU/branch/jump/system: nothing to do */
 }
@@ -862,6 +875,8 @@ static void ir_exec_fence(IR_Inst *ir, CPU_state *cpu)
 
 static void ir_exec_inv(IR_Inst *ir, CPU_state *cpu)
 {
-    ir->type = ITYPE_INVALID;
-    INV(ir->pc);
+    ir->type  = ITYPE_INVALID;
+    ir->fault = 1;          /* deferred fault: OOO commit or in-order EX raises INV */
+    ir->dnpc  = ir->snpc;   /* fallthrough PC so pipeline has a safe next-PC */
+    (void)cpu;
 }

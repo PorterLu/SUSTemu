@@ -26,6 +26,20 @@ word_t vaddr_read(vaddr_t addr, int len)
 	}
 }
 
+int vaddr_read_level(vaddr_t addr, int len, word_t *out_val)
+{
+	if (addr >= 0x80000000 && addr < 0x88000000) {
+		if (g_num_cores > 1) {
+			int other = 1 - g_current_hartid;
+			cache_snoop_flush_dirty(cores[other].l1d, L2_cache, addr);
+		}
+		return cache_read_level(L1D_cache, L2_cache, addr, len, out_val);
+	} else {
+		*out_val = paddr_read(addr, len);
+		return 0;   /* Direct DRAM mapped as L1-hit latency for non-cache range */
+	}
+}
+
 void vaddr_write(vaddr_t addr, int len, word_t data)
 {
 	if (addr >= 0x80000000 && addr < 0x88000000) {
