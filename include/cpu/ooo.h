@@ -7,7 +7,7 @@
  * Explicit register renaming via RAT + physical register file (PRF).
  * Reservation stations (RS) for out-of-order issue.
  * Re-Order Buffer (ROB) for in-order commit.
- * Single-issue, single CDB per cycle.
+ * Issue width and execution unit latencies configured via exec_cfg.h.
  */
 
 #ifndef __CPU_OOO_H__
@@ -17,6 +17,7 @@
 #include <ir.h>
 #include <pipeline.h>   /* PipeReg */
 #include <stdint.h>
+#include <exec_cfg.h>
 
 /* ── Physical register file ─────────────────────────────────────────────── */
 #define NUM_PHYS_REGS 64
@@ -59,6 +60,8 @@ typedef struct {
     int     rob_idx;    /* Corresponding ROB slot                           */
     int     src1_ready; word_t src1_val; int src1_ptag;
     int     src2_ready; word_t src2_val; int src2_ptag;
+    int     cycles_rem; /* Remaining execution cycles (counts down to 0)   */
+    int     eu_type;    /* Execution unit type: EU_INT / EU_MUL / EU_LSU   */
 } RSEntry;
 
 /* ── IS→EX and EX→MEM latches (carry phys_rd and rob_idx alongside IR) ──── */
@@ -67,16 +70,19 @@ typedef struct {
     int     phys_rd;
     int     rob_idx;
     int     valid;
+    int     cycles_rem; /* countdown for multi-cycle MEM stage (loads only) */
 } OOOLatch;
 
 /* ── Statistics ──────────────────────────────────────────────────────────── */
 typedef struct {
     uint64_t cycles;
-    uint64_t insts;              /* Committed instruction count             */
-    uint64_t rob_full_stalls;    /* Cycles stalled due to ROB full          */
-    uint64_t rs_full_stalls;     /* Cycles stalled due to RS full           */
-    uint64_t mispred_flushes;    /* Misprediction-induced pipeline flushes  */
-    uint64_t serializing_stalls; /* Cycles stalled waiting for ROB drain    */
+    uint64_t insts;                 /* Committed instruction count              */
+    uint64_t rob_full_stalls;       /* Cycles stalled due to ROB full           */
+    uint64_t rs_full_stalls;        /* Cycles stalled due to RS full            */
+    uint64_t mispred_flushes;       /* Misprediction-induced pipeline flushes   */
+    uint64_t serializing_stalls;    /* Cycles stalled waiting for ROB drain     */
+    uint64_t eu_contention_stalls;  /* Cycles stalled due to execution unit full */
+    uint64_t branch_penalty_cycles; /* Total ROB entries flushed on mispredicts */
 } OOOStats;
 
 /* ── Top-level OOO engine state ──────────────────────────────────────────── */
@@ -96,11 +102,16 @@ typedef struct {
     /* Reservation stations */
     RSEntry  rs[RS_SIZE];
 
-    /* Pipeline latches */
-    PipeReg  latch_if_id;   /* IF → ID   (instruction fetched, to be decoded) */
-    PipeReg  latch_id_rn;   /* ID → RN   (decoded, to be renamed)             */
-    OOOLatch latch_is_ex;   /* IS → EX   (issued, to be executed)             */
-    OOOLatch latch_ex_mem;  /* EX → MEM  (executed, awaiting mem access)      */
+    /* Pipeline latches: front-end FETCH_WIDTH-wide, back-end ISSUE_WIDTH-wide */
+    PipeReg  latch_if_id[FETCH_WIDTH];      /* IF → ID                        */
+    PipeReg  latch_id_rn[FETCH_WIDTH];      /* ID → RN                        */
+    OOOLatch latch_is_ex[ISSUE_WIDTH];      /* IS → EX  (one slot per issue)  */
+    OOOLatch latch_ex_mem[ISSUE_WIDTH];     /* EX → MEM (one slot per issue)  */
+
+    /* Functional unit busy counters */
+    int      eu_int_busy;   /* Number of INT units currently in use  */
+    int      eu_mul_busy;   /* Number of MUL units currently in use  */
+    int      eu_lsu_busy;   /* Number of LSU units currently in use  */
 
     vaddr_t  fetch_pc;      /* PC of the next instruction to fetch            */
 } OOOState;

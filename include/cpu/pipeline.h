@@ -22,19 +22,21 @@ typedef struct {
 
 /* ── Whole-pipeline state ───────────────────────────────────────────────── */
 typedef struct {
-    PipeReg  id;        /* IF→ID latch  (instruction fetched, awaiting decode) */
-    PipeReg  ex;        /* ID→EX latch  (decoded, awaiting execution)           */
-    PipeReg  mem;       /* EX→MEM latch (executed, awaiting memory access)      */
-    PipeReg  wb;        /* MEM→WB latch (memory done, awaiting writeback)        */
-    vaddr_t  fetch_pc;  /* IF stage: address of the next instruction to fetch    */
+    PipeReg  id;             /* IF→ID latch  (instruction fetched, awaiting decode) */
+    PipeReg  ex;             /* ID→EX latch  (decoded, awaiting execution)           */
+    PipeReg  mem;            /* EX→MEM latch (executed, awaiting memory access)      */
+    PipeReg  wb;             /* MEM→WB latch (memory done, awaiting writeback)        */
+    vaddr_t  fetch_pc;       /* IF stage: address of the next instruction to fetch    */
+    int      mem_stall_rem;  /* Remaining cache-miss stall cycles (0 = not stalling)  */
 } Pipeline;
 
 /* ── Statistics ─────────────────────────────────────────────────────────── */
 typedef struct {
-    uint64_t cycles;          /* Total clock cycles elapsed                     */
-    uint64_t insts;           /* Retired (committed) instructions                */
-    uint64_t stall_load_use;  /* Load-use hazard stalls (1 cycle each)           */
-    uint64_t stall_control;   /* Control-hazard flushes (2 cycles each)          */
+    uint64_t cycles;            /* Total clock cycles elapsed                     */
+    uint64_t insts;             /* Retired (committed) instructions                */
+    uint64_t stall_load_use;    /* Load-use hazard stalls (1 cycle each)           */
+    uint64_t stall_control;     /* Control-hazard flushes (2 cycles each)          */
+    uint64_t stall_cache_miss;  /* Cache-miss stall cycles (L2/DRAM latency)       */
 } PipeStats;
 
 /* ── Globals (defined in pipeline.c) ───────────────────────────────────── */

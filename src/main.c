@@ -25,6 +25,7 @@
 #include <core.h>
 
 char* elf_file = NULL;
+int   g_trace_en = 0;   /* --trace: per-cycle pipeline trace to log file */
 
 extern int g_inorder_mode;  /* defined in exec.c */
 extern int g_bpred_mode;    /* defined in exec.c */
@@ -51,6 +52,7 @@ int parse_args(int argc, char *argv[])
 		{"bpred",	no_argument			, NULL, 'p'},
 		{"ooo",		no_argument			, NULL, 'o'},
 		{"dual",	no_argument			, NULL, 'd'},
+		{"trace",	no_argument			, &g_trace_en, 1},
 		{0		, 	0					, NULL,  0 }
 	};
 

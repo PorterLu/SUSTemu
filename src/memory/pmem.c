@@ -33,7 +33,7 @@ word_t paddr_read(paddr_t addr, int len)
 {
 	pmp_check(addr, false, false);
 	addr = addr & 0xffffffff;
-	if(addr >= 0x80000000 && addr <= 0x88000000)
+	if(addr >= MBASE && addr < MBASE + MSIZE)
 		return host_read(guest_to_host(addr), len);
 	else
 		return mmio_read(addr, len);
@@ -45,7 +45,7 @@ void paddr_write(paddr_t addr, int len, word_t data)
 {
 	pmp_check(addr, false, true);
 	addr = addr & 0xffffffff;
-	if(addr >= 0x80000000 && addr <= 0x88000000){
+	if(addr >= MBASE && addr < MBASE + MSIZE){
 		host_write(guest_to_host(addr), len, data);
 		return;
 	}

@@ -55,7 +55,7 @@ static void exec_once()
 	IR_Inst ir;
 	ir_decode(raw, pc, snpc, &ir);
 	ir_execute(&ir, &cpu);
-	ir_mem_access(&ir);    /* MEM stage: actual load/store */
+	ir_mem_access(&ir, NULL);    /* MEM stage: actual load/store */
 	ir_writeback(&ir, &cpu);
 
 	cpu.pc   = ir.dnpc;

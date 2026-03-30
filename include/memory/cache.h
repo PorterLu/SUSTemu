@@ -44,6 +44,11 @@ word_t cache_read(Cache *l1, Cache *l2, paddr_t addr, int len);
 void cache_write(Cache *l1, Cache *l2, paddr_t addr, int len, word_t data);
 void init_cache_system();
 
+/* cache_read_level: like cache_read() but also returns the cache level hit.
+ * Returns: 0 = L1 hit, 1 = L2 hit, 2 = DRAM (L2 miss).
+ * The data value is written to *out_val. */
+int cache_read_level(Cache *l1, Cache *l2, paddr_t addr, int len, word_t *out_val);
+
 #define PREFETCH_DEGREE 2
 void cache_prefetch(Cache *l1, Cache *l2, paddr_t miss_addr);
 
