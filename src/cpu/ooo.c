@@ -33,11 +33,16 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
+#include <log.h>
 
 /* ── Globals ─────────────────────────────────────────────────────────────── */
 OOOState ooo;
 OOOStats ooo_stats;
 int      g_ooo_mode = 0;
+
+/* Per-cycle commit trace buffer (populated by ooo_stage_commit, read by ooo_trace_cycle) */
+static IR_Inst ooo_tc_ir[COMMIT_WIDTH];
+static int     ooo_tc_n = 0;
 
 /* ── Forward declarations ────────────────────────────────────────────────── */
 static void ooo_stage_commit(void);
@@ -141,16 +146,21 @@ static void ooo_flush_after(int branch_rob_idx)
     }
 
     /* Flush IS→EX and EX→MEM latches if they hold a newer instruction */
-    if (ooo.latch_is_ex.valid &&
-        rob_newer_than(ooo.latch_is_ex.rob_idx, branch_rob_idx))
-        ooo.latch_is_ex.valid = 0;
-    if (ooo.latch_ex_mem.valid &&
-        rob_newer_than(ooo.latch_ex_mem.rob_idx, branch_rob_idx))
-        ooo.latch_ex_mem.valid = 0;
+    int s;
+    for (s = 0; s < ISSUE_WIDTH; s++) {
+        if (ooo.latch_is_ex[s].valid &&
+            rob_newer_than(ooo.latch_is_ex[s].rob_idx, branch_rob_idx))
+            ooo.latch_is_ex[s].valid = 0;
+        if (ooo.latch_ex_mem[s].valid &&
+            rob_newer_than(ooo.latch_ex_mem[s].rob_idx, branch_rob_idx))
+            ooo.latch_ex_mem[s].valid = 0;
+    }
 
     /* Flush front-end latches unconditionally */
-    ooo.latch_if_id.valid = 0;
-    ooo.latch_id_rn.valid = 0;
+    for (s = 0; s < FETCH_WIDTH; s++) {
+        ooo.latch_if_id[s].valid = 0;
+        ooo.latch_id_rn[s].valid = 0;
+    }
 }
 
 /* ── ooo_init ────────────────────────────────────────────────────────────── */
@@ -197,123 +207,158 @@ void ooo_init(void)
 static void ooo_stage_commit(void)
 {
     ROBEntry *rob;
+    int n;
 
-    if (ooo.rob_count == 0) return;
+    ooo_tc_n = 0;  /* reset per-cycle trace capture */
 
-    rob = &ooo.rob[ooo.rob_head];
-    if (!rob->valid || !rob->ready) return;
+    for (n = 0; n < COMMIT_WIDTH; n++) {
+        if (ooo.rob_count == 0) break;
 
-    /* STORE: deferred memory write — happens here, not in MEM stage */
-    if (rob->ir.type == ITYPE_STORE)
-        vaddr_write(rob->ir.mem_addr, rob->ir.mem_width, rob->store_data);
+        rob = &ooo.rob[ooo.rob_head];
+        if (!rob->valid || !rob->ready) break;
 
-    /* Update architectural register file and committed RAT */
-    if (rob->arch_rd != -1 && rob->arch_rd != 0) {
-        cpu.gpr[rob->arch_rd]   = ooo.prf[rob->phys_rd].value;
-        ooo.rrat[rob->arch_rd]  = rob->phys_rd;
-        freelist_push(rob->old_phys);   /* Return the superseded physical reg */
+        if (g_trace_en) ooo_tc_ir[ooo_tc_n++] = rob->ir;
+
+        /* STORE: deferred memory write — happens here, not in MEM stage */
+        if (rob->ir.type == ITYPE_STORE)
+            vaddr_write(rob->ir.mem_addr, rob->ir.mem_width, rob->store_data);
+
+        /* Update architectural register file and committed RAT */
+        if (rob->arch_rd != -1 && rob->arch_rd != 0) {
+            cpu.gpr[rob->arch_rd]   = ooo.prf[rob->phys_rd].value;
+            ooo.rrat[rob->arch_rd]  = rob->phys_rd;
+            freelist_push(rob->old_phys);   /* Return the superseded physical reg */
+        }
+        cpu.gpr[0] = 0;   /* x0 is always zero */
+
+        cpu.pc = rob->ir.dnpc;
+
+        rob->valid = 0;
+        ooo.rob_head  = (ooo.rob_head + 1) % ROB_SIZE;
+        ooo.rob_count--;
+        ooo_stats.insts++;
     }
-    cpu.gpr[0] = 0;   /* x0 is always zero */
-
-    cpu.pc = rob->ir.dnpc;
-
-    rob->valid = 0;
-    ooo.rob_head  = (ooo.rob_head + 1) % ROB_SIZE;
-    ooo.rob_count--;
-    ooo_stats.insts++;
 }
 
 /* ── ooo_stage_mem ───────────────────────────────────────────────────────── */
 
 static void ooo_stage_mem(void)
 {
+    int s;
     IR_Inst *ir;
     int phys_rd, rob_idx;
 
-    if (!ooo.latch_ex_mem.valid) return;
+    for (s = 0; s < ISSUE_WIDTH; s++) {
+        if (!ooo.latch_ex_mem[s].valid) continue;
 
-    ir      = &ooo.latch_ex_mem.ir;
-    phys_rd = ooo.latch_ex_mem.phys_rd;
-    rob_idx = ooo.latch_ex_mem.rob_idx;
+        ir      = &ooo.latch_ex_mem[s].ir;
+        phys_rd = ooo.latch_ex_mem[s].phys_rd;
+        rob_idx = ooo.latch_ex_mem[s].rob_idx;
 
-    /* The ROB entry may have been flushed if a prior misprediction was
-     * detected in the same cycle before stage_mem ran.  Discard silently. */
-    if (!ooo.rob[rob_idx].valid) {
-        ooo.latch_ex_mem.valid = 0;
-        return;
+        /* The ROB entry may have been flushed if a prior misprediction was
+         * detected in the same cycle before stage_mem ran.  Discard silently. */
+        if (!ooo.rob[rob_idx].valid) {
+            ooo.latch_ex_mem[s].valid = 0;
+            continue;
+        }
+
+        if (ir->type == ITYPE_LOAD) {
+            /* First visit (cycles_rem == 0): perform the memory access and
+             * obtain the cache-level latency.  If lat > 1, park the latch
+             * here for lat-1 more cycles before making the result visible. */
+            if (ooo.latch_ex_mem[s].cycles_rem == 0) {
+                int lat = 1;
+                ir_mem_access(ir, &lat);          /* fills ir->result + lat */
+                ooo.latch_ex_mem[s].ir.result = ir->result;  /* save value */
+                if (lat > 1) {
+                    ooo.latch_ex_mem[s].cycles_rem = lat - 1;
+                    continue;                     /* latch stays occupied   */
+                }
+            } else {
+                /* Counting down: decrement and keep waiting if not done yet */
+                ooo.latch_ex_mem[s].cycles_rem--;
+                if (ooo.latch_ex_mem[s].cycles_rem > 0) continue;
+                /* Countdown finished: result already stored in latch ir */
+                ir->result = ooo.latch_ex_mem[s].ir.result;
+            }
+            ooo.prf[phys_rd].value = ir->result;
+            ooo.prf[phys_rd].ready = 1;
+            cdb_broadcast(phys_rd);
+            ooo.rob[rob_idx].ready = 1;
+            /* Propagate loaded value into ROB snapshot for completeness */
+            ooo.rob[rob_idx].ir.result = ir->result;
+        } else if (ir->type == ITYPE_STORE) {
+            /* Save store data in ROB; actual memory write at commit */
+            ooo.rob[rob_idx].store_data = ir->src2_val;
+            ooo.rob[rob_idx].ready = 1;
+        }
+
+        ooo.latch_ex_mem[s].valid = 0;
     }
-
-    if (ir->type == ITYPE_LOAD) {
-        ir_mem_access(ir);                      /* Fills ir->result */
-        ooo.prf[phys_rd].value = ir->result;
-        ooo.prf[phys_rd].ready = 1;
-        cdb_broadcast(phys_rd);
-        ooo.rob[rob_idx].ready = 1;
-        /* Propagate loaded value into ROB snapshot for completeness */
-        ooo.rob[rob_idx].ir.result = ir->result;
-    } else if (ir->type == ITYPE_STORE) {
-        /* Save store data in ROB; actual memory write at commit */
-        ooo.rob[rob_idx].store_data = ir->src2_val;
-        ooo.rob[rob_idx].ready = 1;
-    }
-
-    ooo.latch_ex_mem.valid = 0;
 }
 
 /* ── ooo_stage_ex ────────────────────────────────────────────────────────── */
 
 static void ooo_stage_ex(void)
 {
+    int      s;
     IR_Inst  ir;
     int      phys_rd, rob_idx;
     vaddr_t  predicted;
 
-    if (!ooo.latch_is_ex.valid) return;
+    for (s = 0; s < ISSUE_WIDTH; s++) {
+        if (!ooo.latch_is_ex[s].valid) continue;
+        /* If the EX→MEM slot is stalled (multi-cycle load counting down),
+         * this EX slot cannot advance — stall to preserve ordering. */
+        if (ooo.latch_ex_mem[s].valid) continue;
 
-    ir      = ooo.latch_is_ex.ir;
-    phys_rd = ooo.latch_is_ex.phys_rd;
-    rob_idx = ooo.latch_is_ex.rob_idx;
+        ir      = ooo.latch_is_ex[s].ir;
+        phys_rd = ooo.latch_is_ex[s].phys_rd;
+        rob_idx = ooo.latch_is_ex[s].rob_idx;
 
-    ooo.latch_is_ex.valid = 0;
+        ooo.latch_is_ex[s].valid = 0;
 
-    /* Skip if the ROB entry was flushed by a preceding misprediction */
-    if (!ooo.rob[rob_idx].valid) return;
+        /* Skip if the ROB entry was flushed by a preceding misprediction */
+        if (!ooo.rob[rob_idx].valid) continue;
 
-    /* Execute: compute ALU result, branch outcome, memory address, etc. */
-    ir_execute(&ir, &cpu);
+        /* Execute: compute ALU result, branch outcome, memory address, etc. */
+        ir_execute(&ir, &cpu);
 
-    /* Forward to EX→MEM latch */
-    ooo.latch_ex_mem.ir      = ir;
-    ooo.latch_ex_mem.phys_rd = phys_rd;
-    ooo.latch_ex_mem.rob_idx = rob_idx;
-    ooo.latch_ex_mem.valid   = 1;
+        /* Forward to EX→MEM latch */
+        ooo.latch_ex_mem[s].ir         = ir;
+        ooo.latch_ex_mem[s].phys_rd    = phys_rd;
+        ooo.latch_ex_mem[s].rob_idx    = rob_idx;
+        ooo.latch_ex_mem[s].cycles_rem = 0;
+        ooo.latch_ex_mem[s].valid      = 1;
 
-    /* Update ROB snapshot with execution results */
-    ooo.rob[rob_idx].ir = ir;
+        /* Update ROB snapshot with execution results */
+        ooo.rob[rob_idx].ir = ir;
 
-    if (ir.type != ITYPE_LOAD && ir.type != ITYPE_STORE) {
-        /* ALU/branch/jump/system: result is ready now; write PRF and CDB */
-        if (phys_rd >= 0) {
-            ooo.prf[phys_rd].value = ir.result;
-            ooo.prf[phys_rd].ready = 1;
-            if (phys_rd > 0) cdb_broadcast(phys_rd);
+        if (ir.type != ITYPE_LOAD && ir.type != ITYPE_STORE) {
+            /* ALU/branch/jump/system: result is ready now; write PRF and CDB */
+            if (phys_rd >= 0) {
+                ooo.prf[phys_rd].value = ir.result;
+                ooo.prf[phys_rd].ready = 1;
+                if (phys_rd > 0) cdb_broadcast(phys_rd);
+            }
+            ooo.rob[rob_idx].ready = 1;
         }
-        ooo.rob[rob_idx].ready = 1;
-    }
-    /* LOAD/STORE: rob becomes ready in stage_mem */
+        /* LOAD/STORE: rob becomes ready in stage_mem */
 
-    /* ── Control hazard / branch misprediction check ───────────────────── */
-    if (ir.type == ITYPE_BRANCH ||
-        ir.type == ITYPE_JAL    ||
-        ir.type == ITYPE_JALR) {
+        /* ── Control hazard / branch misprediction check ───────────────────── */
+        if (ir.type == ITYPE_BRANCH ||
+            ir.type == ITYPE_JAL    ||
+            ir.type == ITYPE_JALR) {
 
-        if (g_bpred_mode) bpred_update(&bpred, &ir);
+            if (g_bpred_mode) bpred_update(&bpred, &ir);
 
-        predicted = ir.bp_predicted_pc ? ir.bp_predicted_pc : ir.snpc;
-        if (ir.dnpc != predicted) {
-            ooo_flush_after(rob_idx);
-            ooo_stats.mispred_flushes++;
-            ooo.fetch_pc = ir.dnpc;
+            predicted = ir.bp_predicted_pc ? ir.bp_predicted_pc : ir.snpc;
+            if (ir.dnpc != predicted) {
+                ooo_flush_after(rob_idx);
+                ooo_stats.mispred_flushes++;
+                ooo.fetch_pc = ir.dnpc;
+                /* Slots s+1.. are now flushed; their latch_is_ex[s].valid=0 */
+            }
         }
     }
 }
@@ -326,33 +371,49 @@ static void ooo_stage_ex(void)
  */
 static void ooo_stage_is(void)
 {
-    int i, best, da, db;
+    int s, i, best, da, db;
 
-    if (ooo.latch_is_ex.valid) return;  /* EX is occupied; cannot issue */
+    for (s = 0; s < ISSUE_WIDTH; s++) {
+        if (ooo.latch_is_ex[s].valid) continue;  /* slot still occupied */
 
-    best = -1;
-    for (i = 0; i < RS_SIZE; i++) {
-        if (!ooo.rs[i].valid) continue;
-        if (!ooo.rs[i].src1_ready || !ooo.rs[i].src2_ready) continue;
-        if (best == -1) {
-            best = i;
-        } else {
-            da = (ooo.rs[i].rob_idx  - ooo.rob_head + ROB_SIZE) % ROB_SIZE;
-            db = (ooo.rs[best].rob_idx - ooo.rob_head + ROB_SIZE) % ROB_SIZE;
-            if (da < db) best = i;
+        best = -1;
+        for (i = 0; i < RS_SIZE; i++) {
+            if (!ooo.rs[i].valid) continue;
+            if (!ooo.rs[i].src1_ready || !ooo.rs[i].src2_ready) continue;
+
+            /* Memory ordering: block a LOAD if any older unready STORE exists */
+            if ((ooo.rs[i].ir.raw & 0x7f) == 0x03) {
+                int blocked = 0, j;
+                for (j = ooo.rob_head; j != ooo.rs[i].rob_idx;
+                     j = (j + 1) % ROB_SIZE) {
+                    ROBEntry *roe = &ooo.rob[j];
+                    if (!roe->valid) continue;
+                    if (!roe->ready && (roe->ir.raw & 0x7f) == 0x23) {
+                        blocked = 1; break;
+                    }
+                }
+                if (blocked) continue;
+            }
+
+            if (best == -1) {
+                best = i;
+            } else {
+                da = (ooo.rs[i].rob_idx    - ooo.rob_head + ROB_SIZE) % ROB_SIZE;
+                db = (ooo.rs[best].rob_idx - ooo.rob_head + ROB_SIZE) % ROB_SIZE;
+                if (da < db) best = i;
+            }
         }
+
+        if (best == -1) break;  /* nothing issuable; no point trying next slot */
+
+        ooo.latch_is_ex[s].ir          = ooo.rs[best].ir;
+        ooo.latch_is_ex[s].ir.src1_val = ooo.rs[best].src1_val;
+        ooo.latch_is_ex[s].ir.src2_val = ooo.rs[best].src2_val;
+        ooo.latch_is_ex[s].phys_rd     = ooo.rs[best].phys_rd;
+        ooo.latch_is_ex[s].rob_idx     = ooo.rs[best].rob_idx;
+        ooo.latch_is_ex[s].valid       = 1;
+        ooo.rs[best].valid             = 0;
     }
-
-    if (best == -1) return;
-
-    ooo.latch_is_ex.ir          = ooo.rs[best].ir;
-    /* Override src vals with the values captured at issue time */
-    ooo.latch_is_ex.ir.src1_val = ooo.rs[best].src1_val;
-    ooo.latch_is_ex.ir.src2_val = ooo.rs[best].src2_val;
-    ooo.latch_is_ex.phys_rd     = ooo.rs[best].phys_rd;
-    ooo.latch_is_ex.rob_idx     = ooo.rs[best].rob_idx;
-    ooo.latch_is_ex.valid       = 1;
-    ooo.rs[best].valid          = 0;
 }
 
 /* ── ooo_stage_rn ────────────────────────────────────────────────────────── */
@@ -363,144 +424,149 @@ static void ooo_stage_is(void)
  */
 static void ooo_stage_rn(void)
 {
-    IR_Inst  *ir;
-    int       rs_count, rob_idx, rs_slot;
+    int       n, rs_used, rob_idx, rs_slot;
     int       phys_rd, old_phys;
     int       i;
+    IR_Inst  *ir;
     ROBEntry *rob;
     RSEntry  *rs;
 
-    if (!ooo.latch_id_rn.valid) return;
+    if (!ooo.latch_id_rn[0].valid) return;
 
-    ir = &ooo.latch_id_rn.ir;
+    /* Count RS entries currently used (updated inline as we allocate) */
+    rs_used = 0;
+    for (i = 0; i < RS_SIZE; i++) if (ooo.rs[i].valid) rs_used++;
 
-    /* ── Serialising instructions: drain ROB first ──────────────────────── */
-    if (ir->serializing && ooo.rob_count > 0) {
-        ooo_stats.serializing_stalls++;
-        return;
-    }
+    for (n = 0; n < FETCH_WIDTH; n++) {
+        if (!ooo.latch_id_rn[n].valid) break;
 
-    /* ── Structural hazard checks ───────────────────────────────────────── */
-    rs_count = 0;
-    for (i = 0; i < RS_SIZE; i++) if (ooo.rs[i].valid) rs_count++;
+        ir = &ooo.latch_id_rn[n].ir;
 
-    if (ooo.rob_count >= ROB_SIZE) { ooo_stats.rob_full_stalls++; return; }
-    if (rs_count >= RS_SIZE)       { ooo_stats.rs_full_stalls++;  return; }
-    if (ir->rd != -1 && ir->rd != 0 && ooo.freelist.count == 0) {
-        /* Need a physical register but none available */
-        ooo_stats.rob_full_stalls++;
-        return;
-    }
+        /* ── Serialising instructions: drain ROB first, rename alone ──────── */
+        if (ir->serializing) {
+            if (ooo.rob_count > 0 || n > 0) {
+                if (n == 0) ooo_stats.serializing_stalls++;
+                break;
+            }
+        }
 
-    /* ── Allocate ROB slot ──────────────────────────────────────────────── */
-    rob_idx        = ooo.rob_tail;
-    ooo.rob_tail   = (ooo.rob_tail + 1) % ROB_SIZE;
-    ooo.rob_count++;
+        /* ── Structural hazard checks (using live counts) ──────────────────── */
+        if (ooo.rob_count >= ROB_SIZE) { ooo_stats.rob_full_stalls++; break; }
+        if (rs_used >= RS_SIZE)        { ooo_stats.rs_full_stalls++;  break; }
+        if (ir->rd != -1 && ir->rd != 0 && ooo.freelist.count == 0) {
+            ooo_stats.rob_full_stalls++; break;
+        }
 
-    rob           = &ooo.rob[rob_idx];
-    rob->ir       = *ir;
-    rob->arch_rd  = ir->rd;
-    rob->ready    = 0;
-    rob->valid    = 1;
-    rob->store_data = 0;
+        /* ── Allocate ROB slot ──────────────────────────────────────────────── */
+        rob_idx      = ooo.rob_tail;
+        ooo.rob_tail = (ooo.rob_tail + 1) % ROB_SIZE;
+        ooo.rob_count++;
 
-    /*
-     * ── Read source register mappings BEFORE renaming the destination ─────
-     *
-     * For instructions where rs1 == rd (e.g. addi x2, x2, 816) we must
-     * capture the OLD mapping of rd (which is the source value) before we
-     * overwrite rat[rd] with the new physical register.
-     */
-    /* Source 1 */
-    int p1_tag = -1; word_t p1_val = 0; int p1_ready = 1;
-    if (ir->rs1 > 0) {
-        p1_tag   = ooo.rat[ir->rs1];
-        p1_ready = ooo.prf[p1_tag].ready;
-        p1_val   = ooo.prf[p1_tag].value;
-    }
-    /* Source 2 */
-    int p2_tag = -1; word_t p2_val = 0; int p2_ready = 1;
-    if (ir->rs2 > 0) {
-        p2_tag   = ooo.rat[ir->rs2];
-        p2_ready = ooo.prf[p2_tag].ready;
-        p2_val   = ooo.prf[p2_tag].value;
-    }
+        rob           = &ooo.rob[rob_idx];
+        rob->ir       = *ir;
+        rob->arch_rd  = ir->rd;
+        rob->ready    = 0;
+        rob->valid    = 1;
+        rob->store_data = 0;
 
-    /* ── Physical register allocation ───────────────────────────────────── */
-    if (ir->rd != -1 && ir->rd != 0) {
-        phys_rd  = freelist_pop();
-        old_phys = ooo.rat[ir->rd];
-        ooo.rat[ir->rd]        = phys_rd;  /* Now safe: sources already read */
-        ooo.prf[phys_rd].ready = 0;
-        ooo.prf[phys_rd].value = 0;
-    } else if (ir->rd == 0) {
-        phys_rd  = 0;   /* p0 = x0; never rename */
-        old_phys = 0;
-    } else {
-        phys_rd  = -1;  /* No destination (stores, branches, system) */
-        old_phys = -1;
-    }
-    rob->phys_rd  = phys_rd;
-    rob->old_phys = old_phys;
-
-    /* ── Find a free RS slot ────────────────────────────────────────────── */
-    rs_slot = -1;
-    for (i = 0; i < RS_SIZE; i++) {
-        if (!ooo.rs[i].valid) { rs_slot = i; break; }
-    }
-    /* rs_slot must exist: we checked rs_count < RS_SIZE above */
-    rs          = &ooo.rs[rs_slot];
-    rs->valid   = 1;
-    rs->ir      = *ir;
-    rs->phys_rd = phys_rd;
-    rs->rob_idx = rob_idx;
-
-    /* ── Source 1 operand (using pre-rename mapping) ────────────────────── */
-    if (ir->rs1 <= 0) {
         /*
-         * rs1 == -1: no register source (TYPE_U, TYPE_J, TYPE_N) — use the
-         *            immediate already in src1_val from ir_decode.
-         * rs1 ==  0: source is x0, value is always 0.
+         * ── Read source register mappings BEFORE renaming the destination ─────
+         *
+         * For instructions where rs1 == rd (e.g. addi x2, x2, 816) we must
+         * capture the OLD mapping of rd (which is the source value) before we
+         * overwrite rat[rd] with the new physical register.
+         *
+         * For instruction n=1: if instruction n=0 wrote rd=x2, then
+         * ooo.rat[x2] already points to n=0's new phys reg — correct forwarding.
          */
-        rs->src1_ready = 1;
-        rs->src1_val   = (ir->rs1 == 0) ? (word_t)0 : ir->src1_val;
-        rs->src1_ptag  = 0;
-    } else {
-        rs->src1_ptag  = p1_tag;
-        if (p1_ready) {
+        int p1_tag = -1; word_t p1_val = 0; int p1_ready = 1;
+        if (ir->rs1 > 0) {
+            p1_tag   = ooo.rat[ir->rs1];
+            p1_ready = ooo.prf[p1_tag].ready;
+            p1_val   = ooo.prf[p1_tag].value;
+        }
+        int p2_tag = -1; word_t p2_val = 0; int p2_ready = 1;
+        if (ir->rs2 > 0) {
+            p2_tag   = ooo.rat[ir->rs2];
+            p2_ready = ooo.prf[p2_tag].ready;
+            p2_val   = ooo.prf[p2_tag].value;
+        }
+
+        /* ── Physical register allocation ───────────────────────────────────── */
+        if (ir->rd != -1 && ir->rd != 0) {
+            phys_rd  = freelist_pop();
+            old_phys = ooo.rat[ir->rd];
+            ooo.rat[ir->rd]        = phys_rd;  /* Now safe: sources already read */
+            ooo.prf[phys_rd].ready = 0;
+            ooo.prf[phys_rd].value = 0;
+        } else if (ir->rd == 0) {
+            phys_rd  = 0;   /* p0 = x0; never rename */
+            old_phys = 0;
+        } else {
+            phys_rd  = -1;  /* No destination (stores, branches, system) */
+            old_phys = -1;
+        }
+        rob->phys_rd  = phys_rd;
+        rob->old_phys = old_phys;
+
+        /* ── Find a free RS slot ────────────────────────────────────────────── */
+        rs_slot = -1;
+        for (i = 0; i < RS_SIZE; i++) {
+            if (!ooo.rs[i].valid) { rs_slot = i; break; }
+        }
+        /* rs_slot must exist: we checked rs_used < RS_SIZE above */
+        rs          = &ooo.rs[rs_slot];
+        rs->valid   = 1;
+        rs->ir      = *ir;
+        rs->phys_rd = phys_rd;
+        rs->rob_idx = rob_idx;
+
+        /* ── Source 1 operand (using pre-rename mapping) ────────────────────── */
+        if (ir->rs1 <= 0) {
             rs->src1_ready = 1;
-            rs->src1_val   = p1_val;
+            rs->src1_val   = (ir->rs1 == 0) ? (word_t)0 : ir->src1_val;
+            rs->src1_ptag  = 0;
         } else {
-            rs->src1_ready = 0;
-            rs->src1_val   = 0;
+            rs->src1_ptag  = p1_tag;
+            if (p1_ready) {
+                rs->src1_ready = 1;
+                rs->src1_val   = p1_val;
+            } else {
+                rs->src1_ready = 0;
+                rs->src1_val   = 0;
+            }
         }
-    }
 
-    /* ── Source 2 operand (using pre-rename mapping) ────────────────────── */
-    if (ir->rs2 == -1) {
-        /*
-         * rs2 == -1: I-type immediate already encoded in src2_val, or there
-         *            is no second source at all (TYPE_U, TYPE_J, TYPE_N).
-         */
-        rs->src2_ready = 1;
-        rs->src2_val   = ir->src2_val;
-        rs->src2_ptag  = 0;
-    } else if (ir->rs2 == 0) {
-        rs->src2_ready = 1;
-        rs->src2_val   = 0;
-        rs->src2_ptag  = 0;
-    } else {
-        rs->src2_ptag  = p2_tag;
-        if (p2_ready) {
+        /* ── Source 2 operand (using pre-rename mapping) ────────────────────── */
+        if (ir->rs2 == -1) {
             rs->src2_ready = 1;
-            rs->src2_val   = p2_val;
-        } else {
-            rs->src2_ready = 0;
+            rs->src2_val   = ir->src2_val;
+            rs->src2_ptag  = 0;
+        } else if (ir->rs2 == 0) {
+            rs->src2_ready = 1;
             rs->src2_val   = 0;
+            rs->src2_ptag  = 0;
+        } else {
+            rs->src2_ptag  = p2_tag;
+            if (p2_ready) {
+                rs->src2_ready = 1;
+                rs->src2_val   = p2_val;
+            } else {
+                rs->src2_ready = 0;
+                rs->src2_val   = 0;
+            }
         }
+
+        ooo.latch_id_rn[n].valid = 0;
+        rs_used++;  /* update live count for next slot's structural check */
     }
 
-    ooo.latch_id_rn.valid = 0;
+    /* Compact: if slot 0 was consumed and slot 1 remains, shift it to slot 0
+     * so the ID stage's stall check (latch_id_rn[0].valid) stays canonical. */
+    if (!ooo.latch_id_rn[0].valid && ooo.latch_id_rn[1].valid) {
+        ooo.latch_id_rn[0] = ooo.latch_id_rn[1];
+        ooo.latch_id_rn[1].valid = 0;
+    }
 }
 
 /* ── ooo_stage_id ────────────────────────────────────────────────────────── */
@@ -512,49 +578,112 @@ static void ooo_stage_rn(void)
  */
 static void ooo_stage_id(void)
 {
-    if (!ooo.latch_if_id.valid) {
-        /* No instruction in IF→ID; nothing to forward */
-        return;
-    }
+    int s;
 
-    if (ooo.latch_id_rn.valid) {
-        /* RN is stalled (structural hazard or serialising wait); ID stalls */
-        return;
-    }
+    if (!ooo.latch_if_id[0].valid) return;  /* nothing to forward */
+    if (ooo.latch_id_rn[0].valid)  return;  /* RN stalled; compaction keeps [0] canonical */
 
-    ooo.latch_id_rn   = ooo.latch_if_id;
-    ooo.latch_if_id.valid = 0;
+    for (s = 0; s < FETCH_WIDTH; s++) {
+        ooo.latch_id_rn[s]       = ooo.latch_if_id[s];
+        ooo.latch_if_id[s].valid = 0;
+    }
 }
 
 /* ── ooo_stage_if ────────────────────────────────────────────────────────── */
 
 static void ooo_stage_if(void)
 {
+    int       s;
     vaddr_t   pc;
     uint32_t  raw;
     BPredResult r;
 
-    /* Stall if the IF→ID latch is still occupied (ID or RN stalled) */
-    if (ooo.latch_if_id.valid) return;
+    /* Stall if the fetch group hasn't been consumed yet */
+    if (ooo.latch_if_id[0].valid) return;
 
-    pc  = ooo.fetch_pc;
-    raw = (uint32_t)vaddr_ifetch(pc, 4);
+    for (s = 0; s < FETCH_WIDTH; s++) {
+        pc = ooo.fetch_pc;
 
-    ir_decode(raw, pc, pc + 4, &ooo.latch_if_id.ir);
-    ooo.latch_if_id.valid = 1;
-    ooo.fetch_pc = pc + 4;  /* Sequential default; EX may override on flush */
+        /* Sanity check: ensure fetch_pc is within valid memory range */
+        if (pc < 0x80000000 || pc >= 0x88000000) {
+            fprintf(stderr, "[OOO-ERROR] Invalid fetch_pc: 0x%lx, resetting to 0x80000000\n",
+                    (unsigned long)pc);
+            ooo.fetch_pc = 0x80000000;
+            pc = ooo.fetch_pc;
+        }
 
-    if (g_bpred_mode) {
-        r = bpred_predict(&bpred, pc);
-        ooo.latch_if_id.ir.bp_predict_taken = r.taken;
-        ooo.latch_if_id.ir.bp_predicted_pc  =
-            (r.taken && r.btb_hit) ? r.target : pc + 4;
-        if (r.taken && r.btb_hit)
-            ooo.fetch_pc = r.target;
-    } else {
-        ooo.latch_if_id.ir.bp_predict_taken = 0;
-        ooo.latch_if_id.ir.bp_predicted_pc  = pc + 4;
+        raw = (uint32_t)vaddr_ifetch(pc, 4);
+
+        ir_decode(raw, pc, pc + 4, &ooo.latch_if_id[s].ir);
+        ooo.latch_if_id[s].valid = 1;
+        ooo.fetch_pc = pc + 4;  /* Sequential default; EX may override on flush */
+
+        if (g_bpred_mode) {
+            r = bpred_predict(&bpred, pc);
+            ooo.latch_if_id[s].ir.bp_predict_taken = r.taken;
+            ooo.latch_if_id[s].ir.bp_predicted_pc  =
+                (r.taken && r.btb_hit) ? r.target : pc + 4;
+            if (r.taken && r.btb_hit) {
+                ooo.fetch_pc = r.target;
+                break;  /* redirect: don't fetch next sequential instruction */
+            }
+        } else {
+            ooo.latch_if_id[s].ir.bp_predict_taken = 0;
+            ooo.latch_if_id[s].ir.bp_predicted_pc  = pc + 4;
+        }
     }
+}
+
+/* ── ooo_trace_cycle ─────────────────────────────────────────────────────── */
+/*
+ * Print a one-line per-cycle pipeline snapshot to the log file.
+ * Enabled by --trace (g_trace_en=1); requires -l <file> to set log_fp.
+ *
+ * Format:
+ *   [C= N] IF:pc/name  pc/name  | IS:pc/name  --  | MEM:--  --  | COMMIT:pc/name  --
+ */
+static void ooo_trace_cycle(void)
+{
+    if (!g_trace_en || !log_fp) return;
+
+#define TS(valid, pc, name) do {                                    \
+    if (valid)                                                       \
+        fprintf(log_fp, "%08x/%-4s  ", (unsigned)(pc),             \
+                (name) ? (name) : "??");                            \
+    else                                                             \
+        fprintf(log_fp, "--            ");                          \
+} while (0)
+
+    fprintf(log_fp, "[C=%6" PRIu64 "] IF:", ooo_stats.cycles);
+    for (int s = 0; s < FETCH_WIDTH; s++)
+        TS(ooo.latch_if_id[s].valid,
+           ooo.latch_if_id[s].ir.pc,
+           ooo.latch_if_id[s].ir.name);
+
+    fprintf(log_fp, " | IS:");
+    for (int s = 0; s < ISSUE_WIDTH; s++)
+        TS(ooo.latch_is_ex[s].valid,
+           ooo.latch_is_ex[s].ir.pc,
+           ooo.latch_is_ex[s].ir.name);
+
+    fprintf(log_fp, " | MEM:");
+    for (int s = 0; s < ISSUE_WIDTH; s++)
+        TS(ooo.latch_ex_mem[s].valid,
+           ooo.latch_ex_mem[s].ir.pc,
+           ooo.latch_ex_mem[s].ir.name);
+
+    fprintf(log_fp, " | COMMIT:");
+    for (int n = 0; n < COMMIT_WIDTH; n++) {
+        if (n < ooo_tc_n)
+            TS(1, ooo_tc_ir[n].pc, ooo_tc_ir[n].name);
+        else
+            TS(0, 0, NULL);
+    }
+
+    fprintf(log_fp, "\n");
+    fflush(log_fp);
+
+#undef TS
 }
 
 /* ── ooo_cycle ───────────────────────────────────────────────────────────── */
@@ -575,6 +704,7 @@ void ooo_cycle(void)
     ooo_stats.cycles++;
     g_sim_cycles++;
     g_sim_instret = ooo_stats.insts;
+    ooo_trace_cycle();
 }
 
 /* ── ooo_report ──────────────────────────────────────────────────────────── */

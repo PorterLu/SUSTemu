@@ -171,11 +171,36 @@ word_t cache_read(Cache *l1, Cache *l2, paddr_t addr, int len) {
         fetch_block(l1, l2, addr, line);
         cache_prefetch(l1, l2, addr);
     }
-    
+
     word_t res = 0;
     uint32_t offset = addr & (BLOCK_SIZE - 1);
     memcpy(&res, line->data + offset, len);
     return res;
+}
+
+/* cache_read_level — like cache_read() but returns the cache level that
+ * serviced the request: 0=L1 hit, 1=L2 hit, 2=DRAM (both L1 and L2 missed).
+ * The loaded value is written to *out_val.
+ * Used by the OOO pipeline MEM stage to determine stall duration. */
+int cache_read_level(Cache *l1, Cache *l2, paddr_t addr, int len, word_t *out_val) {
+    int l1_hit;
+    CacheLine *line = find_line(l1, addr, &l1_hit);
+    int level;
+    if (!l1_hit) {
+        /* Probe L2 without modifying statistics */
+        int l2_hit;
+        find_line_quiet(l2, addr, &l2_hit);
+        level = l2_hit ? 1 : 2;
+        fetch_block(l1, l2, addr, line);
+        cache_prefetch(l1, l2, addr);
+    } else {
+        level = 0;
+    }
+    word_t res = 0;
+    uint32_t offset = addr & (BLOCK_SIZE - 1);
+    memcpy(&res, line->data + offset, len);
+    *out_val = res;
+    return level;
 }
 
 void cache_write(Cache *l1, Cache *l2, paddr_t addr, int len, word_t data) {

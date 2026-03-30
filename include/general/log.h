@@ -5,6 +5,7 @@
 
 extern char *log_file ;
 extern FILE *log_fp ;
+extern int   g_trace_en;   /* --trace: enable per-cycle pipeline trace to log file */
 
 void init_log(char *log_file);
 

@@ -83,7 +83,7 @@ static void exec_once_core(Core *c)
     IR_Inst ir;
     ir_decode(raw, pc, snpc, &ir);
     ir_execute(&ir, &cpu);
-    ir_mem_access(&ir);
+    ir_mem_access(&ir, NULL);
     ir_writeback(&ir, &cpu);
 
     cpu.pc = ir.dnpc;
