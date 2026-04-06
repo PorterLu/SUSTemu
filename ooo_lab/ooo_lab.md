@@ -169,12 +169,12 @@ make run-inorder && make run-ooo
 
 | LAT_L2_HIT | bench | In-Order CPI | OOO CPI | Speedup |
 |------------|-------|--------------|---------|---------|
-| 8 (default) | parallel | | | |
-| 8 (default) | serial   | | | |
-| 20 | parallel | | | |
-| 20 | serial   | | | |
-| 40 | parallel | | | |
-| 40 | serial   | | | |
+| 8 (default) | parallel | 1.30 | 1.09 | 1.19× |
+| 8 (default) | serial   | 1.31 | 1.07 | 1.22× |
+| 20 | parallel | 1.63 | 1.26 | 1.29× |
+| 20 | serial   | 1.56 | 1.19 | 1.31× |
+| 40 | parallel | 2.19 | 1.54 | 1.42× |
+| 40 | serial   | 1.98 | 1.40 | 1.41× |
 
 **Submit:** completed table.
 

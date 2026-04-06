@@ -9,3 +9,5 @@ test/**/*.bin
 test/**/*.elf
 test/**/*.o
 test/**/*.d
+.metals/
+.DS_STORE
