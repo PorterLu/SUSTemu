@@ -1,4 +1,4 @@
-REPO    := ../../..
+REPO    := ../..
 EMU     := $(REPO)/build/sustemu
 
 CC      = riscv64-unknown-elf-gcc

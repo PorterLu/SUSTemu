@@ -10,7 +10,7 @@ CFLAGS  = -march=rv64im_zicsr -mabi=lp64 -mcmodel=medany -O2 \
           -Wall -Wno-unused-variable -Wno-unused-function
 CFLAGS_DBG = $(CFLAGS) -g
 
-.PHONY: all run-ooo disasm clean
+.PHONY: all run-bpred run-bpred2 disasm clean
 
 all: bench.bin
 
@@ -26,13 +26,13 @@ bench.elf: start.o bench.o
 bench.bin: bench.elf
 	$(OBJCOPY) -O binary $< $@
 
-# Q3a: in-order mode (mispred penalty = 1 cycle)
+# Tournament predictor (meta-selector)
 run-bpred: bench.bin $(EMU)
-	$(EMU) --inorder --bpred -b -l /dev/null -e bench.elf bench.bin
-
-# Q3a: OOO mode (mispred penalty = ROB flush ~16 cycles, cold/warm gap is larger)
-run-ooo: bench.bin $(EMU)
 	$(EMU) --ooo --bpred -b -l /dev/null -e bench.elf bench.bin
+
+# Confidence-fusion predictor (no meta table)
+run-bpred2: bench.bin $(EMU)
+	$(EMU) --ooo --bpred2 -b -l /dev/null -e bench.elf bench.bin
 
 bench.dbg.elf: start.o bench.c csr_perf.h
 	$(CC) $(CFLAGS_DBG) -c bench.c -o bench.dbg.o

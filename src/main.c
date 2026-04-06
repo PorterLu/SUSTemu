@@ -13,6 +13,7 @@
 #include <exec.h>
 #include <watchpoint.h>
 #include <disasm.hpp>
+#include <cpu/bpred2.h>
 #include <elftl.h>
 #include <serial.h>
 #include <timer.h>
@@ -50,6 +51,7 @@ int parse_args(int argc, char *argv[])
 		{"task"	, 	required_argument	, NULL, 't'},
 		{"inorder",	no_argument			, NULL, 'i'},
 		{"bpred",	no_argument			, NULL, 'p'},
+		{"bpred2",	no_argument			, &g_bpred2_mode, 1},
 		{"ooo",		no_argument			, NULL, 'o'},
 		{"dual",	no_argument			, NULL, 'd'},
 		{"trace",	no_argument			, &g_trace_en, 1},

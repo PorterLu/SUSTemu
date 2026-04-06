@@ -26,6 +26,7 @@
 #include <ooo.h>
 #include <core.h>
 #include <bpred.h>
+#include <cpu/bpred2.h>
 #include <csr.h>
 #include <reg.h>
 #include <state.h>
@@ -199,7 +200,8 @@ void ooo_init(void)
 
     ooo.fetch_pc = cpu.pc;
 
-    if (g_bpred_mode) bpred_init(&bpred);
+    if (g_bpred_mode)  bpred_init(&bpred);
+    if (g_bpred2_mode) bpred_init(&bpred2_state);
 }
 
 /* ── ooo_stage_commit ────────────────────────────────────────────────────── */
@@ -377,7 +379,8 @@ static void ooo_stage_ex(void)
             ir.type == ITYPE_JAL    ||
             ir.type == ITYPE_JALR) {
 
-            if (g_bpred_mode) bpred_update(&bpred, &ir);
+            if (g_bpred2_mode) bpred2_update(&bpred2_state, &ir);
+            else if (g_bpred_mode) bpred_update(&bpred, &ir);
 
             predicted = ir.bp_predicted_pc ? ir.bp_predicted_pc : ir.snpc;
             if (ir.dnpc != predicted) {
@@ -651,8 +654,9 @@ static void ooo_stage_if(void)
         ooo.latch_if_id[s].valid = 1;
         ooo.fetch_pc = pc + 4;  /* Sequential default; EX may override on flush */
 
-        if (g_bpred_mode) {
-            r = bpred_predict(&bpred, pc);
+        if (g_bpred_mode || g_bpred2_mode) {
+            r = g_bpred2_mode ? bpred2_predict(&bpred2_state, pc)
+                              : bpred_predict(&bpred, pc);
             ooo.latch_if_id[s].ir.bp_predict_taken = r.taken;
             ooo.latch_if_id[s].ir.bp_predicted_pc  =
                 (r.taken && r.btb_hit) ? r.target : pc + 4;
@@ -782,7 +786,8 @@ void ooo_report(void)
     printf("Serializing stalls  : %" PRIu64 "\n", ooo_stats.serializing_stalls);
     printf("=============================\n\n");
 
-    if (g_bpred_mode) bpred_report(&bpred);
+    if (g_bpred_mode)  bpred_report(&bpred);
+    if (g_bpred2_mode) bpred2_report(&bpred2_state);
 }
 
 /* ── Multi-core entry points ─────────────────────────────────────────────── */

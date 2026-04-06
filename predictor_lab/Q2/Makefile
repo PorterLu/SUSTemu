@@ -1,4 +1,4 @@
-REPO    := ../../..
+REPO    := ../..
 EMU     := $(REPO)/build/sustemu
 
 CC      = riscv64-unknown-elf-gcc
@@ -6,7 +6,7 @@ LD      = riscv64-unknown-elf-ld
 OBJCOPY = riscv64-unknown-elf-objcopy
 OBJDUMP = riscv64-unknown-elf-objdump
 CFLAGS  = -march=rv64im_zicsr -mabi=lp64 -mcmodel=medany -O2 \
-          -ffreestanding -fno-builtin -mno-relax \
+          -ffreestanding -fno-builtin -mno-relax -fno-unroll-loops \
           -Wall -Wno-unused-variable -Wno-unused-function
 CFLAGS_DBG = $(CFLAGS) -g
 
