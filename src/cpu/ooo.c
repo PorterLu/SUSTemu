@@ -646,44 +646,68 @@ static void ooo_trace_cycle(void)
 {
     if (!g_trace_en || !log_fp) return;
 
-#define TS(valid, pc, name) do {                                    \
-    if (valid)                                                       \
-        fprintf(log_fp, "%08x/%-4s  ", (unsigned)(pc),             \
-                (name) ? (name) : "??");                            \
-    else                                                             \
-        fprintf(log_fp, "--            ");                          \
-} while (0)
+    char buf[256];
+    int pos;
 
-    fprintf(log_fp, "[C=%6" PRIu64 "] IF:", ooo_stats.cycles);
-    for (int s = 0; s < FETCH_WIDTH; s++)
-        TS(ooo.latch_if_id[s].valid,
-           ooo.latch_if_id[s].ir.pc,
-           ooo.latch_if_id[s].ir.name);
+    // Each instruction slot: "%08x/%-7s " = 17 chars (valid) or "--               " = 17 chars (invalid)
+    // 2 slots per stage = 34 chars content.
+    // Section widths all equal 41 ("COMMIT:" len=7 + 34 = 41):
+    //   IF:     (3)  + pad 38 = 41
+    //   IS:     (3)  + pad 38 = 41
+    //   MEM:    (4)  + pad 37 = 41
+    //   COMMIT: (7)  + pad 34 = 41
 
-    fprintf(log_fp, " | IS:");
-    for (int s = 0; s < ISSUE_WIDTH; s++)
-        TS(ooo.latch_is_ex[s].valid,
-           ooo.latch_is_ex[s].ir.pc,
-           ooo.latch_is_ex[s].ir.name);
+    fprintf(log_fp, "[C=%6" PRIu64 "] ", ooo_stats.cycles);
 
-    fprintf(log_fp, " | MEM:");
-    for (int s = 0; s < ISSUE_WIDTH; s++)
-        TS(ooo.latch_ex_mem[s].valid,
-           ooo.latch_ex_mem[s].ir.pc,
-           ooo.latch_ex_mem[s].ir.name);
+    // IF stage
+    pos = 0;
+    for (int s = 0; s < FETCH_WIDTH; s++) {
+        if (ooo.latch_if_id[s].valid)
+            pos += sprintf(buf + pos, "%08x/%-7s ",
+                          (unsigned)ooo.latch_if_id[s].ir.pc,
+                          ooo.latch_if_id[s].ir.name ? ooo.latch_if_id[s].ir.name : "??");
+        else
+            pos += sprintf(buf + pos, "--               ");
+    }
+    fprintf(log_fp, "IF:%-38s | ", buf);
 
-    fprintf(log_fp, " | COMMIT:");
+    // IS stage
+    pos = 0;
+    for (int s = 0; s < ISSUE_WIDTH; s++) {
+        if (ooo.latch_is_ex[s].valid)
+            pos += sprintf(buf + pos, "%08x/%-7s ",
+                          (unsigned)ooo.latch_is_ex[s].ir.pc,
+                          ooo.latch_is_ex[s].ir.name ? ooo.latch_is_ex[s].ir.name : "??");
+        else
+            pos += sprintf(buf + pos, "--               ");
+    }
+    fprintf(log_fp, "IS:%-38s | ", buf);
+
+    // MEM stage
+    pos = 0;
+    for (int s = 0; s < ISSUE_WIDTH; s++) {
+        if (ooo.latch_ex_mem[s].valid)
+            pos += sprintf(buf + pos, "%08x/%-7s ",
+                          (unsigned)ooo.latch_ex_mem[s].ir.pc,
+                          ooo.latch_ex_mem[s].ir.name ? ooo.latch_ex_mem[s].ir.name : "??");
+        else
+            pos += sprintf(buf + pos, "--               ");
+    }
+    fprintf(log_fp, "MEM:%-37s | ", buf);
+
+    // COMMIT stage
+    pos = 0;
     for (int n = 0; n < COMMIT_WIDTH; n++) {
         if (n < ooo_tc_n)
-            TS(1, ooo_tc_ir[n].pc, ooo_tc_ir[n].name);
+            pos += sprintf(buf + pos, "%08x/%-7s ",
+                          (unsigned)ooo_tc_ir[n].pc,
+                          ooo_tc_ir[n].name ? ooo_tc_ir[n].name : "??");
         else
-            TS(0, 0, NULL);
+            pos += sprintf(buf + pos, "--               ");
     }
+    fprintf(log_fp, "COMMIT:%-34s\n", buf);
 
-    fprintf(log_fp, "\n");
     fflush(log_fp);
-
-#undef TS
 }
 
 /* ── ooo_cycle ───────────────────────────────────────────────────────────── */
