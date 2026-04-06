@@ -308,6 +308,33 @@ static void ooo_stage_ex(void)
 
     for (s = 0; s < ISSUE_WIDTH; s++) {
         if (!ooo.latch_is_ex[s].valid) continue;
+
+        /* ── Multi-cycle EX countdown (MUL/DIV) ────────────────────────────
+         * cycles_rem == -1: first visit, determine latency.
+         * cycles_rem >  0:  counting down, stall.
+         * cycles_rem == 0:  ready to execute and advance.                  */
+        if (ooo.latch_is_ex[s].cycles_rem == -1) {
+            /* First visit: identify M-extension instructions by raw encoding.
+             * M-ext: opcode=0x33(64-bit) or 0x3B(32-bit W), funct7=0x01.  */
+            uint32_t raw   = (uint32_t)ooo.latch_is_ex[s].ir.raw;
+            uint32_t opc   = raw & 0x7fu;
+            uint32_t funct7 = raw >> 25;
+            int ex_lat = 1;
+            if ((opc == 0x33u || opc == 0x3Bu) && funct7 == 1u) {
+                uint32_t funct3 = (raw >> 12) & 0x7u;
+                ex_lat = (funct3 < 4u) ? LAT_INT_MUL : LAT_INT_DIV;
+            }
+            ooo.latch_is_ex[s].cycles_rem = ex_lat - 1;
+            if (ex_lat > 1) continue;   /* start countdown, not yet done */
+        } else if (ooo.latch_is_ex[s].cycles_rem > 0) {
+            /* Flush check during countdown */
+            if (!ooo.rob[ooo.latch_is_ex[s].rob_idx].valid)
+                ooo.latch_is_ex[s].valid = 0;
+            else
+                ooo.latch_is_ex[s].cycles_rem--;
+            continue;
+        }
+
         /* If the EX→MEM slot is stalled (multi-cycle load counting down),
          * this EX slot cannot advance — stall to preserve ordering. */
         if (ooo.latch_ex_mem[s].valid) continue;
@@ -375,6 +402,11 @@ static void ooo_stage_is(void)
 
     for (s = 0; s < ISSUE_WIDTH; s++) {
         if (ooo.latch_is_ex[s].valid) continue;  /* slot still occupied */
+        /* Don't issue into a slot whose EX→MEM output is still busy.
+         * If we did, the instruction would stall in IS→EX for the full
+         * EX→MEM latency (up to 40 cycles for DRAM), blocking all
+         * younger instructions that depend on it. */
+        if (ooo.latch_ex_mem[s].valid) continue;
 
         best = -1;
         for (i = 0; i < RS_SIZE; i++) {
@@ -411,6 +443,7 @@ static void ooo_stage_is(void)
         ooo.latch_is_ex[s].ir.src2_val = ooo.rs[best].src2_val;
         ooo.latch_is_ex[s].phys_rd     = ooo.rs[best].phys_rd;
         ooo.latch_is_ex[s].rob_idx     = ooo.rs[best].rob_idx;
+        ooo.latch_is_ex[s].cycles_rem  = -1;  /* -1 = not yet started */
         ooo.latch_is_ex[s].valid       = 1;
         ooo.rs[best].valid             = 0;
     }

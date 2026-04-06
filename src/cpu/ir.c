@@ -224,7 +224,10 @@ void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir)
     if (ir->exec_fn == ir_exec_ecall  ||
         ir->exec_fn == ir_exec_mret   ||
         ir->exec_fn == ir_exec_ebreak ||
-        ir->exec_fn == ir_exec_fence)
+        ir->exec_fn == ir_exec_fence  ||
+        ir->exec_fn == ir_exec_csrrw  ||
+        ir->exec_fn == ir_exec_csrrs  ||
+        ir->exec_fn == ir_exec_csrrc)
         ir->serializing = 1;
 }
 
