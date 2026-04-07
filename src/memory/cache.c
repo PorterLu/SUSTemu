@@ -203,6 +203,37 @@ int cache_read_level(Cache *l1, Cache *l2, paddr_t addr, int len, word_t *out_va
     return level;
 }
 
+/* cache_probe_level — probe the cache hierarchy to determine which level
+ * would service addr, WITHOUT filling any cache line.
+ * Returns: 0=L1 hit, 1=L2 hit, 2=DRAM.
+ * Used by the OOO MEM stage on first access to decide stall duration. */
+int cache_probe_level(Cache *l1, Cache *l2, paddr_t addr)
+{
+    int l1_hit;
+    find_line_quiet(l1, addr, &l1_hit);
+    if (l1_hit) return 0;
+    int l2_hit;
+    find_line_quiet(l2, addr, &l2_hit);
+    return l2_hit ? 1 : 2;
+}
+
+/* cache_fill_and_read — fill the cache line (fetch from L2/DRAM into L1)
+ * and return the data at addr.  Called when the MEM-stage countdown reaches
+ * zero, modelling that the block arrives in L1 only after the full latency. */
+word_t cache_fill_and_read(Cache *l1, Cache *l2, paddr_t addr, int len)
+{
+    int hit;
+    CacheLine *line = find_line(l1, addr, &hit);
+    if (!hit) {
+        fetch_block(l1, l2, addr, line);
+        cache_prefetch(l1, l2, addr);
+    }
+    word_t res = 0;
+    uint32_t offset = addr & (BLOCK_SIZE - 1);
+    memcpy(&res, line->data + offset, len);
+    return res;
+}
+
 void cache_write(Cache *l1, Cache *l2, paddr_t addr, int len, word_t data) {
     int hit;
     CacheLine *line = find_line(l1, addr, &hit);

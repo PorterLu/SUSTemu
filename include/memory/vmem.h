@@ -15,5 +15,13 @@ void vaddr_write(vaddr_t addr, int len, word_t data);
  * Returns: 0=L1 hit, 1=L2 hit, 2=DRAM.  Value written to *out_val. */
 int vaddr_read_level(vaddr_t addr, int len, word_t *out_val);
 
+/* vaddr_probe_level — probe cache level WITHOUT filling or reading data.
+ * Returns: 0=L1 hit, 1=L2 hit, 2=DRAM.  No side effects on cache state. */
+int vaddr_probe_level(vaddr_t addr);
+
+/* vaddr_fill_and_read — fill cache line from L2/DRAM into L1, return data.
+ * Called when the OOO MEM-stage countdown expires (deferred cache fill). */
+word_t vaddr_fill_and_read(vaddr_t addr, int len);
+
 
 #endif

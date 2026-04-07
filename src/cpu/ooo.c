@@ -31,6 +31,8 @@
 #include <reg.h>
 #include <state.h>
 #include <vmem.h>
+#include <decode.h>
+#include <exec_cfg.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
@@ -47,8 +49,9 @@ static int     ooo_tc_n = 0;
 
 /* ── Forward declarations ────────────────────────────────────────────────── */
 static void ooo_stage_commit(void);
-static void ooo_stage_mem(void);
-static void ooo_stage_ex(void);
+static void ooo_unit_int(void);
+static void ooo_unit_mul(void);
+static void ooo_unit_lsu(void);
 static void ooo_stage_is(void);
 static void ooo_stage_rn(void);
 static void ooo_stage_id(void);
@@ -148,13 +151,28 @@ static void ooo_flush_after(int branch_rob_idx)
 
     /* Flush IS→EX and EX→MEM latches if they hold a newer instruction */
     int s;
-    for (s = 0; s < ISSUE_WIDTH; s++) {
-        if (ooo.latch_is_ex[s].valid &&
-            rob_newer_than(ooo.latch_is_ex[s].rob_idx, branch_rob_idx))
-            ooo.latch_is_ex[s].valid = 0;
-        if (ooo.latch_ex_mem[s].valid &&
-            rob_newer_than(ooo.latch_ex_mem[s].rob_idx, branch_rob_idx))
-            ooo.latch_ex_mem[s].valid = 0;
+    /* INT unit */
+    for (s = 0; s < NUM_INT_UNITS; s++) {
+        if (ooo.latch_int[s].valid &&
+            rob_newer_than(ooo.latch_int[s].rob_idx, branch_rob_idx))
+            ooo.latch_int[s].valid = 0;
+    }
+    /* MUL unit */
+    for (s = 0; s < NUM_MUL_UNITS; s++) {
+        if (ooo.latch_mul[s].valid &&
+            rob_newer_than(ooo.latch_mul[s].rob_idx, branch_rob_idx))
+            ooo.latch_mul[s].valid = 0;
+    }
+    /* LSU unit: keep valid if MSHR in-flight (cache fill must complete) */
+    for (s = 0; s < NUM_LSU_UNITS; s++) {
+        if (ooo.latch_lsu[s].valid &&
+            rob_newer_than(ooo.latch_lsu[s].rob_idx, branch_rob_idx)) {
+            int mi = ooo.latch_lsu[s].mshr_idx;
+            if (mi >= 0)
+                ooo.latch_lsu[s].flushed = 1;   /* keep valid for MSHR fill */
+            else
+                ooo.latch_lsu[s].valid = 0;
+        }
     }
 
     /* Flush front-end latches unconditionally */
@@ -242,215 +260,333 @@ static void ooo_stage_commit(void)
     }
 }
 
-/* ── ooo_stage_mem ───────────────────────────────────────────────────────── */
+/* ── MSHR helpers ────────────────────────────────────────────────────────── */
 
-static void ooo_stage_mem(void)
+/* Find an existing MSHR entry for the given cache-line-aligned address,
+ * or allocate a new one.  Returns the MSHR index, or -1 if full. */
+static int mshr_find_or_alloc(paddr_t line_addr, int lat)
 {
-    int s;
-    IR_Inst *ir;
-    int phys_rd, rob_idx;
-
-    for (s = 0; s < ISSUE_WIDTH; s++) {
-        if (!ooo.latch_ex_mem[s].valid) continue;
-
-        ir      = &ooo.latch_ex_mem[s].ir;
-        phys_rd = ooo.latch_ex_mem[s].phys_rd;
-        rob_idx = ooo.latch_ex_mem[s].rob_idx;
-
-        /* The ROB entry may have been flushed if a prior misprediction was
-         * detected in the same cycle before stage_mem ran.  Discard silently. */
-        if (!ooo.rob[rob_idx].valid) {
-            ooo.latch_ex_mem[s].valid = 0;
+    int i, free_slot = -1;
+    for (i = 0; i < MSHR_SIZE; i++) {
+        if (!ooo.mshr[i].valid) {
+            if (free_slot == -1) free_slot = i;
             continue;
         }
+        if (ooo.mshr[i].line_addr == line_addr)
+            return i;   /* Found existing in-flight entry for same line */
+    }
+    if (free_slot == -1) return -1;  /* MSHR full */
+    ooo.mshr[free_slot].valid      = 1;
+    ooo.mshr[free_slot].line_addr  = line_addr;
+    ooo.mshr[free_slot].cycles_rem = lat - 1;
+    return free_slot;
+}
 
-        if (ir->type == ITYPE_LOAD) {
-            /* First visit (cycles_rem == 0): perform the memory access and
-             * obtain the cache-level latency.  If lat > 1, park the latch
-             * here for lat-1 more cycles before making the result visible. */
-            if (ooo.latch_ex_mem[s].cycles_rem == 0) {
-                int lat = 1;
-                ir_mem_access(ir, &lat);          /* fills ir->result + lat */
-                ooo.latch_ex_mem[s].ir.result = ir->result;  /* save value */
-                if (lat > 1) {
-                    ooo.latch_ex_mem[s].cycles_rem = lat - 1;
-                    continue;                     /* latch stays occupied   */
-                }
-            } else {
-                /* Counting down: decrement and keep waiting if not done yet */
-                ooo.latch_ex_mem[s].cycles_rem--;
-                if (ooo.latch_ex_mem[s].cycles_rem > 0) continue;
-                /* Countdown finished: result already stored in latch ir */
-                ir->result = ooo.latch_ex_mem[s].ir.result;
-            }
-            ooo.prf[phys_rd].value = ir->result;
-            ooo.prf[phys_rd].ready = 1;
-            cdb_broadcast(phys_rd);
-            ooo.rob[rob_idx].ready = 1;
-            /* Propagate loaded value into ROB snapshot for completeness */
-            ooo.rob[rob_idx].ir.result = ir->result;
-        } else if (ir->type == ITYPE_STORE) {
-            /* Save store data in ROB; actual memory write at commit */
-            ooo.rob[rob_idx].store_data = ir->src2_val;
-            ooo.rob[rob_idx].ready = 1;
-        }
-
-        ooo.latch_ex_mem[s].valid = 0;
+/* Tick all valid MSHR counters once per cycle. */
+static void mshr_tick(void)
+{
+    int i;
+    for (i = 0; i < MSHR_SIZE; i++) {
+        if (ooo.mshr[i].valid && ooo.mshr[i].cycles_rem > 0)
+            ooo.mshr[i].cycles_rem--;
     }
 }
 
-/* ── ooo_stage_ex ────────────────────────────────────────────────────────── */
-
-static void ooo_stage_ex(void)
+/* ── Helper: fill latch slot from RS entry ───────────────────────────────── */
+static void latch_from_rs(OOOLatch *latch, int rs_idx)
 {
-    int      s;
-    IR_Inst  ir;
-    int      phys_rd, rob_idx;
-    vaddr_t  predicted;
+    latch->ir          = ooo.rs[rs_idx].ir;
+    latch->ir.src1_val = ooo.rs[rs_idx].src1_val;
+    latch->ir.src2_val = ooo.rs[rs_idx].src2_val;
+    latch->phys_rd     = ooo.rs[rs_idx].phys_rd;
+    latch->rob_idx     = ooo.rs[rs_idx].rob_idx;
+    latch->cycles_rem  = -1;
+    latch->mshr_idx    = -1;
+    latch->flushed     = 0;
+    latch->valid       = 1;
+    ooo.rs[rs_idx].valid = 0;
+}
 
-    for (s = 0; s < ISSUE_WIDTH; s++) {
-        if (!ooo.latch_is_ex[s].valid) continue;
+/* ── ooo_unit_int ────────────────────────────────────────────────────────── */
+/*
+ * INT functional unit: handles all non-MUL/non-memory instructions.
+ * Single-cycle execution; branches trigger misprediction flush here.
+ */
+static void ooo_unit_int(void)
+{
+    int s;
+    for (s = 0; s < NUM_INT_UNITS; s++) {
+        if (!ooo.latch_int[s].valid) continue;
 
-        /* ── Multi-cycle EX countdown (MUL/DIV) ────────────────────────────
-         * cycles_rem == -1: first visit, determine latency.
-         * cycles_rem >  0:  counting down, stall.
-         * cycles_rem == 0:  ready to execute and advance.                  */
-        if (ooo.latch_is_ex[s].cycles_rem == -1) {
-            /* First visit: identify M-extension instructions by raw encoding.
-             * M-ext: opcode=0x33(64-bit) or 0x3B(32-bit W), funct7=0x01.  */
-            uint32_t raw   = (uint32_t)ooo.latch_is_ex[s].ir.raw;
-            uint32_t opc   = raw & 0x7fu;
-            uint32_t funct7 = raw >> 25;
-            int ex_lat = 1;
-            if ((opc == 0x33u || opc == 0x3Bu) && funct7 == 1u) {
-                uint32_t funct3 = (raw >> 12) & 0x7u;
-                ex_lat = (funct3 < 4u) ? LAT_INT_MUL : LAT_INT_DIV;
-            }
-            ooo.latch_is_ex[s].cycles_rem = ex_lat - 1;
-            if (ex_lat > 1) continue;   /* start countdown, not yet done */
-        } else if (ooo.latch_is_ex[s].cycles_rem > 0) {
-            /* Flush check during countdown */
-            if (!ooo.rob[ooo.latch_is_ex[s].rob_idx].valid)
-                ooo.latch_is_ex[s].valid = 0;
-            else
-                ooo.latch_is_ex[s].cycles_rem--;
-            continue;
-        }
+        IR_Inst ir      = ooo.latch_int[s].ir;
+        int phys_rd     = ooo.latch_int[s].phys_rd;
+        int rob_idx     = ooo.latch_int[s].rob_idx;
 
-        /* If the EX→MEM slot is stalled (multi-cycle load counting down),
-         * this EX slot cannot advance — stall to preserve ordering. */
-        if (ooo.latch_ex_mem[s].valid) continue;
+        ooo.latch_int[s].valid = 0;
 
-        ir      = ooo.latch_is_ex[s].ir;
-        phys_rd = ooo.latch_is_ex[s].phys_rd;
-        rob_idx = ooo.latch_is_ex[s].rob_idx;
+        if (!ooo.rob[rob_idx].valid) continue;  /* flushed by earlier mispred */
 
-        ooo.latch_is_ex[s].valid = 0;
-
-        /* Skip if the ROB entry was flushed by a preceding misprediction */
-        if (!ooo.rob[rob_idx].valid) continue;
-
-        /* Execute: compute ALU result, branch outcome, memory address, etc. */
         ir_execute(&ir, &cpu);
-
-        /* Forward to EX→MEM latch */
-        ooo.latch_ex_mem[s].ir         = ir;
-        ooo.latch_ex_mem[s].phys_rd    = phys_rd;
-        ooo.latch_ex_mem[s].rob_idx    = rob_idx;
-        ooo.latch_ex_mem[s].cycles_rem = 0;
-        ooo.latch_ex_mem[s].valid      = 1;
-
-        /* Update ROB snapshot with execution results */
         ooo.rob[rob_idx].ir = ir;
 
-        if (ir.type != ITYPE_LOAD && ir.type != ITYPE_STORE) {
-            /* ALU/branch/jump/system: result is ready now; write PRF and CDB */
-            if (phys_rd >= 0) {
-                ooo.prf[phys_rd].value = ir.result;
-                ooo.prf[phys_rd].ready = 1;
-                if (phys_rd > 0) cdb_broadcast(phys_rd);
-            }
-            ooo.rob[rob_idx].ready = 1;
+        if (phys_rd >= 0) {
+            ooo.prf[phys_rd].value = ir.result;
+            ooo.prf[phys_rd].ready = 1;
+            if (phys_rd > 0) cdb_broadcast(phys_rd);
         }
-        /* LOAD/STORE: rob becomes ready in stage_mem */
+        ooo.rob[rob_idx].ready = 1;
 
-        /* ── Control hazard / branch misprediction check ───────────────────── */
+        /* Branch misprediction check */
         if (ir.type == ITYPE_BRANCH ||
             ir.type == ITYPE_JAL    ||
             ir.type == ITYPE_JALR) {
-
             if (g_bpred2_mode) bpred2_update(&bpred2_state, &ir);
             else if (g_bpred_mode) bpred_update(&bpred, &ir);
 
-            predicted = ir.bp_predicted_pc ? ir.bp_predicted_pc : ir.snpc;
+            vaddr_t predicted = ir.bp_predicted_pc ? ir.bp_predicted_pc : ir.snpc;
             if (ir.dnpc != predicted) {
                 ooo_flush_after(rob_idx);
                 ooo_stats.mispred_flushes++;
                 ooo.fetch_pc = ir.dnpc;
-                /* Slots s+1.. are now flushed; their latch_is_ex[s].valid=0 */
             }
+        }
+    }
+}
+
+/* ── ooo_unit_mul ────────────────────────────────────────────────────────── */
+/*
+ * MUL/DIV functional unit: multi-cycle execution.
+ * cycles_rem == -1: first visit, set latency.
+ * cycles_rem >  0:  counting down.
+ * cycles_rem == 0:  execute and writeback.
+ */
+static void ooo_unit_mul(void)
+{
+    int s;
+    for (s = 0; s < NUM_MUL_UNITS; s++) {
+        if (!ooo.latch_mul[s].valid) continue;
+
+        if (ooo.latch_mul[s].cycles_rem == -1) {
+            uint32_t raw    = (uint32_t)ooo.latch_mul[s].ir.raw;
+            uint32_t opc    = raw & 0x7fu;
+            uint32_t funct7 = raw >> 25;
+            uint32_t funct3 = (raw >> 12) & 0x7u;
+            int lat = ((opc == 0x33u || opc == 0x3Bu) && funct7 == 1u)
+                      ? ((funct3 < 4u) ? LAT_INT_MUL : LAT_INT_DIV)
+                      : 1;
+            ooo.latch_mul[s].cycles_rem = lat - 1;
+            if (lat > 1) continue;
+        } else if (ooo.latch_mul[s].cycles_rem > 0) {
+            if (!ooo.rob[ooo.latch_mul[s].rob_idx].valid)
+                ooo.latch_mul[s].valid = 0;
+            else
+                ooo.latch_mul[s].cycles_rem--;
+            continue;
+        }
+
+        IR_Inst ir  = ooo.latch_mul[s].ir;
+        int phys_rd = ooo.latch_mul[s].phys_rd;
+        int rob_idx = ooo.latch_mul[s].rob_idx;
+
+        ooo.latch_mul[s].valid = 0;
+
+        if (!ooo.rob[rob_idx].valid) continue;
+
+        ir_execute(&ir, &cpu);
+        ooo.rob[rob_idx].ir = ir;
+
+        if (phys_rd >= 0) {
+            ooo.prf[phys_rd].value = ir.result;
+            ooo.prf[phys_rd].ready = 1;
+            if (phys_rd > 0) cdb_broadcast(phys_rd);
+        }
+        ooo.rob[rob_idx].ready = 1;
+    }
+}
+
+/* ── ooo_unit_lsu ────────────────────────────────────────────────────────── */
+/*
+ * LSU functional unit: handles LOAD and STORE.
+ * Merges address calculation (old EX stage) and memory access (old MEM stage).
+ *
+ * cycles_rem == -1: first visit — execute to compute mem_addr, then:
+ *   STORE: save data in ROB, mark ready, done.
+ *   LOAD L1 hit: fill_and_read immediately, CDB broadcast, done.
+ *   LOAD L2/DRAM: allocate MSHR, set cycles_rem, wait.
+ * cycles_rem == 0 (after MSHR countdown): fill_and_read, CDB, done.
+ *
+ * flushed=1: ROB was flushed but MSHR in-flight; complete fill without writeback.
+ */
+static void ooo_unit_lsu(void)
+{
+    static const int level_to_lat[3] = { LAT_L1_HIT, LAT_L2_HIT, LAT_DRAM };
+    int s;
+
+    for (s = 0; s < NUM_LSU_UNITS; s++) {
+        if (!ooo.latch_lsu[s].valid) continue;
+
+        IR_Inst *ir = &ooo.latch_lsu[s].ir;
+        int phys_rd = ooo.latch_lsu[s].phys_rd;
+        int rob_idx = ooo.latch_lsu[s].rob_idx;
+        int mi      = ooo.latch_lsu[s].mshr_idx;
+
+        /* ── ROB flushed: only care if MSHR is in-flight ────────────────── */
+        if (!ooo.rob[rob_idx].valid || ooo.latch_lsu[s].flushed) {
+            if (mi < 0) { ooo.latch_lsu[s].valid = 0; continue; }
+            MSHREntry *mshr = &ooo.mshr[mi];
+            if (mshr->cycles_rem > 0) continue;
+            /* Countdown done: fill cache (pollutes it) but skip writeback */
+            vaddr_fill_and_read(ir->mem_addr, ir->mem_width);
+            int still_used = 0, t;
+            for (t = 0; t < NUM_LSU_UNITS; t++) {
+                if (t != s && ooo.latch_lsu[t].valid &&
+                    ooo.latch_lsu[t].mshr_idx == mi)
+                    still_used = 1;
+            }
+            if (!still_used) mshr->valid = 0;
+            ooo.latch_lsu[s].valid = 0;
+            continue;
+        }
+
+        /* ── First visit: compute address ────────────────────────────────── */
+        if (mi == -1 && ooo.latch_lsu[s].cycles_rem == -1) {
+            ir_execute(ir, &cpu);
+            ooo.rob[rob_idx].ir = *ir;
+
+            if (ir->type == ITYPE_STORE) {
+                ooo.rob[rob_idx].store_data = ir->src2_val;
+                ooo.rob[rob_idx].ready = 1;
+                ooo.latch_lsu[s].valid = 0;
+                continue;
+            }
+
+            /* LOAD: probe cache level */
+            int level = vaddr_probe_level(ir->mem_addr);
+            int lat   = level_to_lat[level];
+
+            if (lat == 1) {
+                /* L1 hit: fill and read immediately */
+                goto lsu_do_fill;
+            }
+
+            /* L2/DRAM miss: allocate MSHR */
+            paddr_t line_addr = ir->mem_addr & ~(paddr_t)63;
+            mi = mshr_find_or_alloc(line_addr, lat);
+            if (mi == -1) continue;  /* MSHR full, retry next cycle */
+            ooo.latch_lsu[s].mshr_idx  = mi;
+            ooo.latch_lsu[s].cycles_rem = 0;  /* flag: MSHR allocated */
+            continue;
+        }
+
+        /* ── Waiting on MSHR ─────────────────────────────────────────────── */
+        if (mi >= 0) {
+            if (ooo.mshr[mi].cycles_rem > 0) continue;
+            /* Fall through to fill */
+        }
+
+lsu_do_fill:
+        {
+            word_t raw = vaddr_fill_and_read(ir->mem_addr, ir->mem_width);
+            if (ir->mem_sign) {
+                switch (ir->mem_width) {
+                case 1: ir->result = SEXT(raw,  8); break;
+                case 2: ir->result = SEXT(raw, 16); break;
+                case 4: ir->result = SEXT(raw, 32); break;
+                default: ir->result = raw; break;
+                }
+            } else {
+                switch (ir->mem_width) {
+                case 1: ir->result = UEXT(raw,  8); break;
+                case 2: ir->result = UEXT(raw, 16); break;
+                case 4: ir->result = UEXT(raw, 32); break;
+                default: ir->result = raw; break;
+                }
+            }
+
+            /* STLF: check ROB for most-recent ready STORE to same address */
+            {
+                int scan = ooo.rob_head, match_idx = -1;
+                while (scan != rob_idx) {
+                    ROBEntry *roe = &ooo.rob[scan];
+                    if (roe->valid && roe->ready &&
+                        (roe->ir.raw & 0x7f) == 0x23 &&
+                        roe->ir.mem_addr  == ir->mem_addr &&
+                        roe->ir.mem_width == ir->mem_width)
+                        match_idx = scan;
+                    scan = (scan + 1) % ROB_SIZE;
+                }
+                if (match_idx >= 0)
+                    ir->result = ooo.rob[match_idx].store_data;
+            }
+
+            /* Release MSHR if no other LSU slot still waits on it */
+            if (mi >= 0) {
+                int still_used = 0, t;
+                for (t = 0; t < NUM_LSU_UNITS; t++) {
+                    if (t != s && ooo.latch_lsu[t].valid &&
+                        ooo.latch_lsu[t].mshr_idx == mi)
+                        still_used = 1;
+                }
+                if (!still_used) ooo.mshr[mi].valid = 0;
+            }
+
+            ooo.prf[phys_rd].value = ir->result;
+            ooo.prf[phys_rd].ready = 1;
+            cdb_broadcast(phys_rd);
+            ooo.rob[rob_idx].ready = 1;
+            ooo.rob[rob_idx].ir.result = ir->result;
+            ooo.latch_lsu[s].valid = 0;
         }
     }
 }
 
 /* ── ooo_stage_is ────────────────────────────────────────────────────────── */
 /*
- * Issue: scan the reservation station for the oldest entry whose both
- * source operands are ready.  "Oldest" is defined as smallest distance
- * from rob_head in the circular ROB (in-order age).
+ * Issue stage: route ready instructions from the RS to the appropriate
+ * functional unit (INT / MUL / LSU) based on eu_type set at RN.
+ * Within each unit type, select the oldest ready instruction (smallest
+ * ROB distance from rob_head).
  */
 static void ooo_stage_is(void)
 {
     int s, i, best, da, db;
 
-    for (s = 0; s < ISSUE_WIDTH; s++) {
-        if (ooo.latch_is_ex[s].valid) continue;  /* slot still occupied */
-        /* Don't issue into a slot whose EX→MEM output is still busy.
-         * If we did, the instruction would stall in IS→EX for the full
-         * EX→MEM latency (up to 40 cycles for DRAM), blocking all
-         * younger instructions that depend on it. */
-        if (ooo.latch_ex_mem[s].valid) continue;
-
-        best = -1;
-        for (i = 0; i < RS_SIZE; i++) {
-            if (!ooo.rs[i].valid) continue;
-            if (!ooo.rs[i].src1_ready || !ooo.rs[i].src2_ready) continue;
-
-            /* Memory ordering: block a LOAD if any older unready STORE exists */
-            if ((ooo.rs[i].ir.raw & 0x7f) == 0x03) {
-                int blocked = 0, j;
-                for (j = ooo.rob_head; j != ooo.rs[i].rob_idx;
-                     j = (j + 1) % ROB_SIZE) {
-                    ROBEntry *roe = &ooo.rob[j];
-                    if (!roe->valid) continue;
-                    if (!roe->ready && (roe->ir.raw & 0x7f) == 0x23) {
-                        blocked = 1; break;
-                    }
-                }
-                if (blocked) continue;
-            }
-
-            if (best == -1) {
-                best = i;
-            } else {
-                da = (ooo.rs[i].rob_idx    - ooo.rob_head + ROB_SIZE) % ROB_SIZE;
-                db = (ooo.rs[best].rob_idx - ooo.rob_head + ROB_SIZE) % ROB_SIZE;
-                if (da < db) best = i;
-            }
-        }
-
-        if (best == -1) break;  /* nothing issuable; no point trying next slot */
-
-        ooo.latch_is_ex[s].ir          = ooo.rs[best].ir;
-        ooo.latch_is_ex[s].ir.src1_val = ooo.rs[best].src1_val;
-        ooo.latch_is_ex[s].ir.src2_val = ooo.rs[best].src2_val;
-        ooo.latch_is_ex[s].phys_rd     = ooo.rs[best].phys_rd;
-        ooo.latch_is_ex[s].rob_idx     = ooo.rs[best].rob_idx;
-        ooo.latch_is_ex[s].cycles_rem  = -1;  /* -1 = not yet started */
-        ooo.latch_is_ex[s].valid       = 1;
-        ooo.rs[best].valid             = 0;
+    /* ── Macro: scan RS for best instruction of a given EU type ─────────── */
+#define ISSUE_UNIT(latch_arr, num_slots, eu, do_mem_order) \
+    for (s = 0; s < (num_slots); s++) { \
+        if ((latch_arr)[s].valid) continue; \
+        best = -1; \
+        for (i = 0; i < RS_SIZE; i++) { \
+            if (!ooo.rs[i].valid) continue; \
+            if (ooo.rs[i].eu_type != (eu)) continue; \
+            if (!ooo.rs[i].src1_ready || !ooo.rs[i].src2_ready) continue; \
+            if (do_mem_order && (ooo.rs[i].ir.raw & 0x7f) == 0x03) { \
+                int blocked = 0, j; \
+                for (j = ooo.rob_head; j != ooo.rs[i].rob_idx; \
+                     j = (j + 1) % ROB_SIZE) { \
+                    ROBEntry *roe = &ooo.rob[j]; \
+                    if (!roe->valid) continue; \
+                    if (!roe->ready && (roe->ir.raw & 0x7f) == 0x23) \
+                        { blocked = 1; break; } \
+                } \
+                if (blocked) continue; \
+            } \
+            if (best == -1) { best = i; } else { \
+                da = (ooo.rs[i].rob_idx    - ooo.rob_head + ROB_SIZE) % ROB_SIZE; \
+                db = (ooo.rs[best].rob_idx - ooo.rob_head + ROB_SIZE) % ROB_SIZE; \
+                if (da < db) best = i; \
+            } \
+        } \
+        if (best != -1) latch_from_rs(&(latch_arr)[s], best); \
     }
+
+    ISSUE_UNIT(ooo.latch_int, NUM_INT_UNITS, EU_INT, 0)
+    ISSUE_UNIT(ooo.latch_mul, NUM_MUL_UNITS, EU_MUL, 0)
+    ISSUE_UNIT(ooo.latch_lsu, NUM_LSU_UNITS, EU_LSU, 1)
+
+#undef ISSUE_UNIT
 }
+
 
 /* ── ooo_stage_rn ────────────────────────────────────────────────────────── */
 /*
@@ -556,6 +692,18 @@ static void ooo_stage_rn(void)
         rs->ir      = *ir;
         rs->phys_rd = phys_rd;
         rs->rob_idx = rob_idx;
+
+        /* Classify execution unit type from raw opcode */
+        {
+            uint32_t opc = (uint32_t)ir->raw & 0x7fu;
+            uint32_t f7  = (uint32_t)ir->raw >> 25;
+            if (opc == 0x03u || opc == 0x23u)
+                rs->eu_type = EU_LSU;
+            else if ((opc == 0x33u || opc == 0x3bu) && f7 == 1u)
+                rs->eu_type = EU_MUL;
+            else
+                rs->eu_type = EU_INT;
+        }
 
         /* ── Source 1 operand (using pre-rename mapping) ────────────────────── */
         if (ir->rs1 <= 0) {
@@ -708,29 +856,33 @@ static void ooo_trace_cycle(void)
     }
     fprintf(log_fp, "IF:%-38s | ", buf);
 
-    // IS stage
+    // INT/MUL/LSU units
     pos = 0;
-    for (int s = 0; s < ISSUE_WIDTH; s++) {
-        if (ooo.latch_is_ex[s].valid)
+    for (int s = 0; s < NUM_INT_UNITS; s++) {
+        if (ooo.latch_int[s].valid)
             pos += sprintf(buf + pos, "%08x/%-7s ",
-                          (unsigned)ooo.latch_is_ex[s].ir.pc,
-                          ooo.latch_is_ex[s].ir.name ? ooo.latch_is_ex[s].ir.name : "??");
+                          (unsigned)ooo.latch_int[s].ir.pc,
+                          ooo.latch_int[s].ir.name ? ooo.latch_int[s].ir.name : "??");
         else
             pos += sprintf(buf + pos, "--               ");
     }
-    fprintf(log_fp, "IS:%-38s | ", buf);
-
-    // MEM stage
-    pos = 0;
-    for (int s = 0; s < ISSUE_WIDTH; s++) {
-        if (ooo.latch_ex_mem[s].valid)
+    for (int s = 0; s < NUM_MUL_UNITS; s++) {
+        if (ooo.latch_mul[s].valid)
             pos += sprintf(buf + pos, "%08x/%-7s ",
-                          (unsigned)ooo.latch_ex_mem[s].ir.pc,
-                          ooo.latch_ex_mem[s].ir.name ? ooo.latch_ex_mem[s].ir.name : "??");
+                          (unsigned)ooo.latch_mul[s].ir.pc,
+                          ooo.latch_mul[s].ir.name ? ooo.latch_mul[s].ir.name : "??");
         else
             pos += sprintf(buf + pos, "--               ");
     }
-    fprintf(log_fp, "MEM:%-37s | ", buf);
+    for (int s = 0; s < NUM_LSU_UNITS; s++) {
+        if (ooo.latch_lsu[s].valid)
+            pos += sprintf(buf + pos, "%08x/%-7s ",
+                          (unsigned)ooo.latch_lsu[s].ir.pc,
+                          ooo.latch_lsu[s].ir.name ? ooo.latch_lsu[s].ir.name : "??");
+        else
+            pos += sprintf(buf + pos, "--               ");
+    }
+    fprintf(log_fp, "EU:%-38s | ", buf);
 
     // COMMIT stage
     pos = 0;
@@ -756,8 +908,10 @@ static void ooo_trace_cycle(void)
 void ooo_cycle(void)
 {
     ooo_stage_commit();
-    ooo_stage_mem();
-    ooo_stage_ex();
+    mshr_tick();
+    ooo_unit_lsu();
+    ooo_unit_mul();
+    ooo_unit_int();
     ooo_stage_is();
     ooo_stage_rn();
     ooo_stage_id();
@@ -832,8 +986,10 @@ void ooo_cycle_core(Core *c)
 
     /* Run OOO stages */
     ooo_stage_commit();
-    ooo_stage_mem();
-    ooo_stage_ex();
+    mshr_tick();
+    ooo_unit_lsu();
+    ooo_unit_mul();
+    ooo_unit_int();
     ooo_stage_is();
     ooo_stage_rn();
     ooo_stage_id();
