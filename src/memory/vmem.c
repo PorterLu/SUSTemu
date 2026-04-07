@@ -40,6 +40,26 @@ int vaddr_read_level(vaddr_t addr, int len, word_t *out_val)
 	}
 }
 
+int vaddr_probe_level(vaddr_t addr)
+{
+	if (addr >= 0x80000000 && addr < 0x88000000)
+		return cache_probe_level(L1D_cache, L2_cache, addr);
+	return 0;   /* Non-cache range: treat as L1 hit */
+}
+
+word_t vaddr_fill_and_read(vaddr_t addr, int len)
+{
+	if (addr >= 0x80000000 && addr < 0x88000000) {
+		if (g_num_cores > 1) {
+			int other = 1 - g_current_hartid;
+			cache_snoop_flush_dirty(cores[other].l1d, L2_cache, addr);
+		}
+		return cache_fill_and_read(L1D_cache, L2_cache, addr, len);
+	} else {
+		return paddr_read(addr, len);
+	}
+}
+
 void vaddr_write(vaddr_t addr, int len, word_t data)
 {
 	if (addr >= 0x80000000 && addr < 0x88000000) {

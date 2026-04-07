@@ -49,6 +49,14 @@ void init_cache_system();
  * The data value is written to *out_val. */
 int cache_read_level(Cache *l1, Cache *l2, paddr_t addr, int len, word_t *out_val);
 
+/* cache_probe_level: determine cache level WITHOUT filling any cache line.
+ * Returns: 0 = L1 hit, 1 = L2 hit, 2 = DRAM. No side effects on cache state. */
+int cache_probe_level(Cache *l1, Cache *l2, paddr_t addr);
+
+/* cache_fill_and_read: fill cache line from L2/DRAM into L1, then read data.
+ * Called when the OOO MEM-stage countdown expires. */
+word_t cache_fill_and_read(Cache *l1, Cache *l2, paddr_t addr, int len);
+
 #define PREFETCH_DEGREE 2
 void cache_prefetch(Cache *l1, Cache *l2, paddr_t miss_addr);
 

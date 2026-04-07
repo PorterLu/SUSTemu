@@ -1,13 +1,18 @@
 /*
  * include/cpu/ooo.h — Tomasulo OOO Engine (Phase 4)
  *
- * 7-stage out-of-order pipeline:
- *   IF → ID → RN → IS → EX → MEM → ROB_Commit
+ * 6-stage out-of-order pipeline:
+ *   IF → ID → RN → IS → [INT|MUL|LSU units] → ROB_Commit
  *
  * Explicit register renaming via RAT + physical register file (PRF).
  * Reservation stations (RS) for out-of-order issue.
  * Re-Order Buffer (ROB) for in-order commit.
  * Issue width and execution unit latencies configured via exec_cfg.h.
+ *
+ * Back-end functional units run in parallel:
+ *   - INT unit (NUM_INT_UNITS slots): ALU, branch, jump, CSR
+ *   - MUL unit (NUM_MUL_UNITS slots): MUL/DIV (multi-cycle)
+ *   - LSU unit (NUM_LSU_UNITS slots): LOAD/STORE (addr calc + memory access)
  */
 
 #ifndef __CPU_OOO_H__
@@ -64,6 +69,17 @@ typedef struct {
     int     eu_type;    /* Execution unit type: EU_INT / EU_MUL / EU_LSU   */
 } RSEntry;
 
+/* ── Miss Status Holding Registers (MSHR) ────────────────────────────────── */
+/* Tracks in-flight cache misses.  Multiple loads to the same cache line
+ * share one MSHR entry and wait for a single fill operation. */
+#define MSHR_SIZE 8
+
+typedef struct {
+    int     valid;
+    paddr_t line_addr;   /* cache-line-aligned address: addr & ~63            */
+    int     cycles_rem;  /* countdown to fill (set from LAT_L2_HIT/LAT_DRAM) */
+} MSHREntry;
+
 /* ── IS→EX and EX→MEM latches (carry phys_rd and rob_idx alongside IR) ──── */
 typedef struct {
     IR_Inst ir;
@@ -71,6 +87,8 @@ typedef struct {
     int     rob_idx;
     int     valid;
     int     cycles_rem; /* countdown for multi-cycle MEM stage (loads only) */
+    int     mshr_idx;   /* index into ooo.mshr[], or -1 if not using MSHR   */
+    int     flushed;    /* 1 = ROB was flushed but MSHR fill should complete */
 } OOOLatch;
 
 /* ── Statistics ──────────────────────────────────────────────────────────── */
@@ -102,16 +120,20 @@ typedef struct {
     /* Reservation stations */
     RSEntry  rs[RS_SIZE];
 
-    /* Pipeline latches: front-end FETCH_WIDTH-wide, back-end ISSUE_WIDTH-wide */
-    PipeReg  latch_if_id[FETCH_WIDTH];      /* IF → ID                        */
-    PipeReg  latch_id_rn[FETCH_WIDTH];      /* ID → RN                        */
-    OOOLatch latch_is_ex[ISSUE_WIDTH];      /* IS → EX  (one slot per issue)  */
-    OOOLatch latch_ex_mem[ISSUE_WIDTH];     /* EX → MEM (one slot per issue)  */
+    /* Pipeline latches: front-end FETCH_WIDTH-wide, back-end per functional unit */
+    PipeReg  latch_if_id[FETCH_WIDTH];          /* IF → ID                   */
+    PipeReg  latch_id_rn[FETCH_WIDTH];          /* ID → RN                   */
+    OOOLatch latch_int[NUM_INT_UNITS];           /* INT unit slots            */
+    OOOLatch latch_mul[NUM_MUL_UNITS];           /* MUL/DIV unit slots        */
+    OOOLatch latch_lsu[NUM_LSU_UNITS];           /* LSU unit slots            */
 
     /* Functional unit busy counters */
     int      eu_int_busy;   /* Number of INT units currently in use  */
     int      eu_mul_busy;   /* Number of MUL units currently in use  */
     int      eu_lsu_busy;   /* Number of LSU units currently in use  */
+
+    /* Miss Status Holding Registers: track in-flight cache misses */
+    MSHREntry mshr[MSHR_SIZE];
 
     vaddr_t  fetch_pc;      /* PC of the next instruction to fetch            */
 } OOOState;
