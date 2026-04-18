@@ -5,11 +5,11 @@
 
 /*************************************屏幕大小*************************************
 * 这里逻辑上看到的宽度和高度固定设置为400和300，但是实际在显示的时候，我们申请了一个800 * 600*
-* 的屏幕，这意味着画面会被放大。同时由于一个像素我们用“AARRGGBB”的格式进行存储，所以会占用32个*
-* bits。																		 *
+* 的屏幕，这意味着画面会被放大。同时由于一个像素我们用"AARRGGBB"的格式进行存储，所以会占用32个*
+* bits。SCREEN_W/SCREEN_H/FB_SIZE 定义在 include/device/gpu.h。                  *
 ********************************************************************************/
-#define SCREEN_W 400
-#define SCREEN_H 300
+
+uint8_t *g_fb_base = NULL;  /* direct host pointer to framebuffer; set by init_vga() */
 
 static uint32_t screen_width() {
   return SCREEN_W;
@@ -82,6 +82,7 @@ void init_vga() {
   vgactl_port_base = (uint32_t *)new_space(8);
   vgactl_port_base[0] = (screen_width() << 16) | screen_height();
   vmem = new_space(screen_size());
+  g_fb_base = (uint8_t *)vmem;   /* expose direct pointer for fast path */
   add_mmio_map("vgactl", CONFIG_VGA_CTL_MMIO, vgactl_port_base, 8, NULL);
   add_mmio_map("vmem", CONFIG_FB_ADDR, vmem, screen_size(), NULL);
   init_screen();

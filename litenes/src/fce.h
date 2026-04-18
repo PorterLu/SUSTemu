@@ -14,6 +14,10 @@ void fce_init();
 void fce_run();
 void draw(int x, int y, int idx);
 
+extern uint32_t canvas[SCR_W * SCR_H];
+extern int g_frame_cnt;
+static inline bool candraw_fast() { return g_frame_cnt % (1 + FRAME_SKIP) == 0; }
+
 static const uint32_t palette[64] = {
   0x808080, 0x0000BB, 0x3700BF, 0x8400A6, 0xBB006A, 0xB7001E, 0xB30000, 0x912600,
   0x7B2B00, 0x003E00, 0x00480D, 0x003C22, 0x002F66, 0x000000, 0x050505, 0x050505,
@@ -24,5 +28,11 @@ static const uint32_t palette[64] = {
   0xFFFFFF, 0x84BFFF, 0xBBBBFF, 0xD0BBFF, 0xFFBFEA, 0xFFBFCC, 0xFFC4B7, 0xFFCCAE,
   0xFFD9A2, 0xCCE199, 0xAEEEB7, 0xAAF7EE, 0xB3EEFF, 0xDDDDDD, 0x111111, 0x111111
 };
+
+/* Inline draw — avoids function call overhead in tight PPU loops.
+ * y bounds are guaranteed by callers (scanline 1..240); only x needs checking. */
+static inline void draw_inline(int x, int y, int idx) {
+  if ((unsigned)x < SCR_W) canvas[y * SCR_W + x] = palette[idx];
+}
 
 #endif
