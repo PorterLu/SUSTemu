@@ -12,6 +12,14 @@ Cache *L2_cache = NULL;
 
 // 从底层物理内存加载一整块 (64字节)
 static void load_block_from_mem(paddr_t block_paddr, uint8_t *dest) {
+    /* Fast path: address is in normal physical memory — single 64-byte memcpy
+     * avoids 8× (paddr_read + pmp_check + range-check + memcpy) overhead. */
+    paddr_t pa = block_paddr & 0xffffffff;
+    if (__builtin_expect(pa >= MBASE && pa + BLOCK_SIZE <= MBASE + MSIZE, 1)) {
+        memcpy(dest, guest_to_host(pa), BLOCK_SIZE);
+        return;
+    }
+    /* Fallback for MMIO or out-of-range addresses */
     for (int i = 0; i < BLOCK_SIZE; i += WORD_SIZE) {
         word_t val = paddr_read(block_paddr + i, WORD_SIZE);
         memcpy(dest + i, &val, WORD_SIZE);
@@ -20,6 +28,11 @@ static void load_block_from_mem(paddr_t block_paddr, uint8_t *dest) {
 
 // 将一整块 (64字节) 写回底层物理内存
 static void store_block_to_mem(paddr_t block_paddr, uint8_t *src) {
+    paddr_t pa = block_paddr & 0xffffffff;
+    if (__builtin_expect(pa >= MBASE && pa + BLOCK_SIZE <= MBASE + MSIZE, 1)) {
+        memcpy(guest_to_host(pa), src, BLOCK_SIZE);
+        return;
+    }
     for (int i = 0; i < BLOCK_SIZE; i += WORD_SIZE) {
         word_t val;
         memcpy(&val, src + i, WORD_SIZE);
