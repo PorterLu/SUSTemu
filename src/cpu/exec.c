@@ -165,27 +165,30 @@ void exec(uint64_t n)
 				state = NEMU_STOP;
 #ifdef CONFIG_timer
 			static uint64_t ooo_last = 0;
-			uint64_t ooo_now = get_time();
-			if ((ooo_now - ooo_last) >= 1000000 / 60) {
-				ooo_last = ooo_now;
+			static uint64_t ooo_cycle_ctr = 0;
+			if ((++ooo_cycle_ctr & 1023) == 0) {
+				uint64_t ooo_now = get_time();
+				if ((ooo_now - ooo_last) >= 1000000 / 60) {
+					ooo_last = ooo_now;
 #ifdef CONFIG_gpu
-				vga_update_screen();
+					vga_update_screen();
 #endif
 #ifdef CONFIG_keyboard
-				SDL_Event event;
-				while (SDL_PollEvent(&event)) {
-					switch (event.type) {
-					case SDL_QUIT: state = NEMU_QUIT; break;
-					case SDL_KEYDOWN:
-					case SDL_KEYUP: {
-						uint8_t k = event.key.keysym.scancode;
-						send_key(k, event.key.type == SDL_KEYDOWN);
-						break;
+					SDL_Event event;
+					while (SDL_PollEvent(&event)) {
+						switch (event.type) {
+						case SDL_QUIT: state = NEMU_QUIT; break;
+						case SDL_KEYDOWN:
+						case SDL_KEYUP: {
+							uint8_t k = event.key.keysym.scancode;
+							send_key(k, event.key.type == SDL_KEYDOWN);
+							break;
+						}
+						default: break;
+						}
 					}
-					default: break;
-					}
-				}
 #endif
+				}
 			}
 #endif
 		}
@@ -199,27 +202,30 @@ void exec(uint64_t n)
 				state = NEMU_STOP;
 #ifdef CONFIG_timer
 			static uint64_t pip_last = 0;
-			uint64_t pip_now = get_time();
-			if ((pip_now - pip_last) >= 1000000 / 60) {
-				pip_last = pip_now;
+			static uint64_t pip_cycle_ctr = 0;
+			if ((++pip_cycle_ctr & 1023) == 0) {
+				uint64_t pip_now = get_time();
+				if ((pip_now - pip_last) >= 1000000 / 60) {
+					pip_last = pip_now;
 #ifdef CONFIG_gpu
-				vga_update_screen();
+					vga_update_screen();
 #endif
 #ifdef CONFIG_keyboard
-				SDL_Event event;
-				while (SDL_PollEvent(&event)) {
-					switch (event.type) {
-					case SDL_QUIT: state = NEMU_QUIT; break;
-					case SDL_KEYDOWN:
-					case SDL_KEYUP: {
-						uint8_t k = event.key.keysym.scancode;
-						send_key(k, event.key.type == SDL_KEYDOWN);
-						break;
+					SDL_Event event;
+					while (SDL_PollEvent(&event)) {
+						switch (event.type) {
+						case SDL_QUIT: state = NEMU_QUIT; break;
+						case SDL_KEYDOWN:
+						case SDL_KEYUP: {
+							uint8_t k = event.key.keysym.scancode;
+							send_key(k, event.key.type == SDL_KEYDOWN);
+							break;
+						}
+						default: break;
+						}
 					}
-					default: break;
-					}
-				}
 #endif
+				}
 			}
 #endif
 		}
