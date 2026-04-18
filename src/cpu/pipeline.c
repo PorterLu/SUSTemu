@@ -269,7 +269,7 @@ static void stage_IF(void)
 
     if (g_bpred_mode) {
         /* Query predictor and annotate the instruction for EX to verify */
-        BPredResult r = bpred_predict(&bpred, pc);
+        BPredResult r = bpred_predict(&bpred, pc, raw);
         cpu_pipe.id.ir.bp_predict_taken = r.taken;
         cpu_pipe.id.ir.bp_predicted_pc  = (r.taken && r.btb_hit) ? r.target : pc + 4;
         /* Speculative redirect: if we predict taken and have a BTB target,

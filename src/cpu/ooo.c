@@ -572,6 +572,11 @@ static void ooo_unit_int(void)
                     ooo.rob[rob_idx].ir.fault = 1;
                     /* Still mark ready so the pipeline doesn't stall */
                 } else {
+                    /* Restore RAS to the state it was in when the branch was fetched */
+                    if (g_bpred_mode) {
+                        bpred.ras_top   = ir.ras_top_snap;
+                        bpred.ras_count = ir.ras_cnt_snap;
+                    }
                     ooo_flush_after(rob_idx);
                     ooo_stats.mispred_flushes++;
                     ooo.fetch_pc = ir.dnpc;
@@ -1094,8 +1099,11 @@ static void ooo_stage_if(void)
         ooo.fetch_pc = pc + 4;  /* Sequential default; EX may override on flush */
 
         if (g_bpred_mode || g_bpred2_mode) {
+            /* Snapshot RAS state BEFORE predict (which may push/pop) */
+            ooo.latch_if_id[s].ir.ras_top_snap = bpred.ras_top;
+            ooo.latch_if_id[s].ir.ras_cnt_snap = bpred.ras_count;
             r = g_bpred2_mode ? bpred2_predict(&bpred2_state, pc)
-                              : bpred_predict(&bpred, pc);
+                              : bpred_predict(&bpred, pc, raw);
             ooo.latch_if_id[s].ir.bp_predict_taken = r.taken;
             ooo.latch_if_id[s].ir.bp_predicted_pc  =
                 (r.taken && r.btb_hit) ? r.target : pc + 4;

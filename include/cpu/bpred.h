@@ -36,6 +36,9 @@ typedef struct {
 #define GPHT_SIZE  4096         /* Global PHT = 1 << GHR_BITS                  */
 #define META_SIZE  4096         /* Choice table, same index as Global PHT       */
 
+/* ── Return Address Stack ───────────────────────────────────────────────── */
+#define RAS_SIZE   16          /* 16-entry circular RAS                       */
+
 /* ── Main predictor state ───────────────────────────────────────────────── */
 typedef struct {
     /* Branch Target Buffer */
@@ -51,6 +54,11 @@ typedef struct {
 
     /* Meta selector */
     uint8_t  meta[META_SIZE];  /* 2-bit sat. counter; >= 2 → prefer global       */
+
+    /* Return Address Stack */
+    vaddr_t  ras[RAS_SIZE];    /* Circular stack of return addresses              */
+    int      ras_top;          /* Index of the top-of-stack entry                 */
+    int      ras_count;        /* Number of valid entries in RAS (0..RAS_SIZE)    */
 
     /* Statistics */
     uint64_t predictions;      /* Total predicted branches (BRANCH/JAL/JALR)     */
@@ -71,7 +79,7 @@ extern int g_bpred_mode;        /* set to 1 by --bpred command-line flag */
 
 /* ── API (all functions take explicit BranchPredictor pointer) ──────────── */
 void        bpred_init   (BranchPredictor *bp);
-BPredResult bpred_predict(BranchPredictor *bp, vaddr_t pc);
+BPredResult bpred_predict(BranchPredictor *bp, vaddr_t pc, uint32_t raw);
 void        bpred_update (BranchPredictor *bp, IR_Inst *ir);
 void        bpred_report (BranchPredictor *bp);
 
