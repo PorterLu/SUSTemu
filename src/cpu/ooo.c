@@ -512,11 +512,10 @@ static void mshr_tick(void)
 /* ── Helper: fill latch slot from RS entry ───────────────────────────────── */
 static void latch_from_rs(OOOLatch *latch, int rs_idx)
 {
-    latch->ir          = ooo.rs[rs_idx].ir;
-    latch->ir.src1_val = ooo.rs[rs_idx].src1_val;
-    latch->ir.src2_val = ooo.rs[rs_idx].src2_val;
-    latch->phys_rd     = ooo.rs[rs_idx].phys_rd;
     latch->rob_idx     = ooo.rs[rs_idx].rob_idx;
+    latch->src1_val    = ooo.rs[rs_idx].src1_val;
+    latch->src2_val    = ooo.rs[rs_idx].src2_val;
+    latch->phys_rd     = ooo.rs[rs_idx].phys_rd;
     latch->cycles_rem  = -1;
     latch->mshr_idx    = -1;
     latch->flushed     = 0;
@@ -536,13 +535,17 @@ static void ooo_unit_int(void)
     for (s = 0; s < NUM_INT_UNITS; s++) {
         if (!ooo.latch_int[s].valid) continue;
 
-        IR_Inst ir      = ooo.latch_int[s].ir;
         int phys_rd     = ooo.latch_int[s].phys_rd;
         int rob_idx     = ooo.latch_int[s].rob_idx;
 
         ooo.latch_int[s].valid = 0;
 
         if (!ooo.rob[rob_idx].valid) continue;  /* flushed by earlier mispred */
+
+        /* Build a local IR copy with forwarded source values, execute in-place */
+        IR_Inst ir      = ooo.rob[rob_idx].ir;
+        ir.src1_val     = ooo.latch_int[s].src1_val;
+        ir.src2_val     = ooo.latch_int[s].src2_val;
 
         ir_execute(&ir, &cpu);
         ooo.rob[rob_idx].ir = ir;
@@ -599,8 +602,10 @@ static void ooo_unit_mul(void)
     for (s = 0; s < NUM_MUL_UNITS; s++) {
         if (!ooo.latch_mul[s].valid) continue;
 
+        int rob_idx = ooo.latch_mul[s].rob_idx;
+
         if (ooo.latch_mul[s].cycles_rem == -1) {
-            uint32_t raw    = (uint32_t)ooo.latch_mul[s].ir.raw;
+            uint32_t raw    = (uint32_t)ooo.rob[rob_idx].ir.raw;
             uint32_t opc    = raw & 0x7fu;
             uint32_t funct7 = raw >> 25;
             uint32_t funct3 = (raw >> 12) & 0x7u;
@@ -610,21 +615,22 @@ static void ooo_unit_mul(void)
             ooo.latch_mul[s].cycles_rem = lat - 1;
             if (lat > 1) continue;
         } else if (ooo.latch_mul[s].cycles_rem > 0) {
-            if (!ooo.rob[ooo.latch_mul[s].rob_idx].valid)
+            if (!ooo.rob[rob_idx].valid)
                 ooo.latch_mul[s].valid = 0;
             else
                 ooo.latch_mul[s].cycles_rem--;
             continue;
         }
 
-        IR_Inst ir  = ooo.latch_mul[s].ir;
         int phys_rd = ooo.latch_mul[s].phys_rd;
-        int rob_idx = ooo.latch_mul[s].rob_idx;
 
         ooo.latch_mul[s].valid = 0;
 
         if (!ooo.rob[rob_idx].valid) continue;
 
+        IR_Inst ir  = ooo.rob[rob_idx].ir;
+        ir.src1_val = ooo.latch_mul[s].src1_val;
+        ir.src2_val = ooo.latch_mul[s].src2_val;
         ir_execute(&ir, &cpu);
         ooo.rob[rob_idx].ir = ir;
 
@@ -658,18 +664,19 @@ static void ooo_unit_lsu(void)
     for (s = 0; s < NUM_LSU_UNITS; s++) {
         if (!ooo.latch_lsu[s].valid) continue;
 
-        IR_Inst *ir = &ooo.latch_lsu[s].ir;
         int phys_rd = ooo.latch_lsu[s].phys_rd;
         int rob_idx = ooo.latch_lsu[s].rob_idx;
         int mi      = ooo.latch_lsu[s].mshr_idx;
+        IR_Inst *ir = &ooo.rob[rob_idx].ir;
 
         /* ── ROB flushed: only care if MSHR is in-flight ────────────────── */
         if (!ooo.rob[rob_idx].valid || ooo.latch_lsu[s].flushed) {
             if (mi < 0) { ooo.latch_lsu[s].valid = 0; continue; }
             MSHREntry *mshr = &ooo.mshr[mi];
             if (mshr->cycles_rem > 0) continue;
-            /* Countdown done: fill cache (pollutes it) but skip writeback */
-            vaddr_fill_and_read(ir->mem_addr, ir->mem_width);
+            /* Countdown done: fill cache (pollutes it) but skip writeback.
+             * Use MSHR's line_addr since ROB entry may already be invalid. */
+            vaddr_fill_and_read(mshr->line_addr, 8);
             int still_used = 0, t;
             for (t = 0; t < NUM_LSU_UNITS; t++) {
                 if (t != s && ooo.latch_lsu[t].valid &&
@@ -683,8 +690,11 @@ static void ooo_unit_lsu(void)
 
         /* ── First visit: compute address ────────────────────────────────── */
         if (mi == -1 && ooo.latch_lsu[s].cycles_rem == -1) {
+            /* Inject forwarded source values before execution */
+            ir->src1_val = ooo.latch_lsu[s].src1_val;
+            ir->src2_val = ooo.latch_lsu[s].src2_val;
             ir_execute(ir, &cpu);
-            ooo.rob[rob_idx].ir = *ir;
+            /* ir == &ooo.rob[rob_idx].ir, so no separate writeback needed */
 
             if (ir->type == ITYPE_STORE) {
                 ooo.rob[rob_idx].store_data = ir->src2_val;
@@ -750,15 +760,14 @@ lsu_do_fill:
                  * yet (INT slots busy), so LSU ran first.  Mark as faulted so
                  * the flush triggered by that branch will silently discard this
                  * ROB entry.  If this somehow reaches commit it is a real bug. */
-                ir->fault = 1;
+                ooo.rob[rob_idx].ir.fault = 1;
                 ir->result = 0;
-                int phys_rd = ooo.latch_lsu[s].phys_rd;
-                if (phys_rd > 0) {
-                    ooo.prf[phys_rd].value = 0;
-                    ooo.prf[phys_rd].ready = 1;
-                    cdb_broadcast(phys_rd);
+                int phys_rd2 = ooo.latch_lsu[s].phys_rd;
+                if (phys_rd2 > 0) {
+                    ooo.prf[phys_rd2].value = 0;
+                    ooo.prf[phys_rd2].ready = 1;
+                    cdb_broadcast(phys_rd2);
                 }
-                ooo.rob[rob_idx].ir    = *ir;
                 ooo.rob[rob_idx].ready = 1;
                 ooo.latch_lsu[s].valid = 0;
                 continue;
@@ -851,7 +860,7 @@ static void ooo_stage_is(void)
         while (_mask) { \
             i = __builtin_ctz(_mask); \
             _mask &= _mask - 1; \
-            if (do_mem_order && (ooo.rs[i].ir.raw & 0x7f) == 0x03) { \
+            if (do_mem_order && (ooo.rob[ooo.rs[i].rob_idx].ir.raw & 0x7f) == 0x03) { \
                 if (ooo.unready_store_count > 0) { \
                     int blocked = 0, j; \
                     for (j = ooo.rob_head; j != ooo.rs[i].rob_idx; \
@@ -982,7 +991,6 @@ static void ooo_stage_rn(void)
         ooo.rs_free_mask &= ~(1u << rs_slot);  /* mark as allocated */
         rs          = &ooo.rs[rs_slot];
         rs->valid   = 1;
-        rs->ir      = *ir;
         rs->phys_rd = phys_rd;
         rs->rob_idx = rob_idx;
 
@@ -1158,27 +1166,27 @@ static void ooo_trace_cycle(void)
     // INT/MUL/LSU units
     pos = 0;
     for (int s = 0; s < NUM_INT_UNITS; s++) {
-        if (ooo.latch_int[s].valid)
+        if (ooo.latch_int[s].valid) {
+            IR_Inst *ir = &ooo.rob[ooo.latch_int[s].rob_idx].ir;
             pos += sprintf(buf + pos, "%08x/%-7s ",
-                          (unsigned)ooo.latch_int[s].ir.pc,
-                          ooo.latch_int[s].ir.name ? ooo.latch_int[s].ir.name : "??");
-        else
+                          (unsigned)ir->pc, ir->name ? ir->name : "??");
+        } else
             pos += sprintf(buf + pos, "--               ");
     }
     for (int s = 0; s < NUM_MUL_UNITS; s++) {
-        if (ooo.latch_mul[s].valid)
+        if (ooo.latch_mul[s].valid) {
+            IR_Inst *ir = &ooo.rob[ooo.latch_mul[s].rob_idx].ir;
             pos += sprintf(buf + pos, "%08x/%-7s ",
-                          (unsigned)ooo.latch_mul[s].ir.pc,
-                          ooo.latch_mul[s].ir.name ? ooo.latch_mul[s].ir.name : "??");
-        else
+                          (unsigned)ir->pc, ir->name ? ir->name : "??");
+        } else
             pos += sprintf(buf + pos, "--               ");
     }
     for (int s = 0; s < NUM_LSU_UNITS; s++) {
-        if (ooo.latch_lsu[s].valid)
+        if (ooo.latch_lsu[s].valid) {
+            IR_Inst *ir = &ooo.rob[ooo.latch_lsu[s].rob_idx].ir;
             pos += sprintf(buf + pos, "%08x/%-7s ",
-                          (unsigned)ooo.latch_lsu[s].ir.pc,
-                          ooo.latch_lsu[s].ir.name ? ooo.latch_lsu[s].ir.name : "??");
-        else
+                          (unsigned)ir->pc, ir->name ? ir->name : "??");
+        } else
             pos += sprintf(buf + pos, "--               ");
     }
     fprintf(log_fp, "EU:%-38s | ", buf);

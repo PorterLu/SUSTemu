@@ -74,59 +74,68 @@ int strncmp(const char *s1, const char *s2, size_t n) {
 }
 
 void *memset(void *s, int c, size_t n) {
-	size_t i;
-	if((int64_t)n < 0) return s;
-	for(i=0; i<n; i++)
-		*((char*)s + i) = c;
+	uint8_t *d = (uint8_t *)s;
+	uint8_t  b = (uint8_t)c;
+
+	/* Fill leading unaligned bytes */
+	while (n > 0 && ((uintptr_t)d & 7)) {
+		*d++ = b;
+		n--;
+	}
+	/* Fill 8 bytes at a time */
+	if (n >= 8) {
+		uint64_t w = (uint64_t)b * 0x0101010101010101ULL;
+		uint64_t *p = (uint64_t *)d;
+		size_t words = n >> 3;
+		for (size_t i = 0; i < words; i++) p[i] = w;
+		d += words << 3;
+		n &= 7;
+	}
+	/* Fill trailing bytes */
+	while (n--) *d++ = b;
 	return s;
 }
 
 void *memmove(void *dst, const void *src, size_t n) {
-  	char* tmp = (char *)malloc(n);
-  	size_t i;
-
-  	//firstly, we copy the source to tmp array
-  	for(i = 0; i < n; i++)
-		tmp[i] = *((char*) src + i);
-
-  	//then we move data to destination
-  	for(i = 0; i < n; i++)
-		*((char*) dst + i) = tmp[i];
-
-	free(tmp);
-  	return dst;
+	uint8_t *d = (uint8_t *)dst;
+	const uint8_t *s = (const uint8_t *)src;
+	if (d == s || n == 0) return dst;
+	if (d < s || d >= s + n) {
+		/* Forward copy — no overlap or dst before src */
+		/* Align dst to 8-byte boundary */
+		while (n > 0 && ((uintptr_t)d & 7)) { *d++ = *s++; n--; }
+		/* Copy 8 bytes at a time if src is also aligned */
+		if (!((uintptr_t)s & 7)) {
+			uint64_t *pd = (uint64_t *)d;
+			const uint64_t *ps = (const uint64_t *)s;
+			while (n >= 8) { *pd++ = *ps++; n -= 8; }
+			d = (uint8_t *)pd;
+			s = (const uint8_t *)ps;
+		}
+		while (n--) *d++ = *s++;
+	} else {
+		/* Backward copy — dst overlaps src from behind */
+		d += n; s += n;
+		while (n--) *--d = *--s;
+	}
+	return dst;
 }
 
 void *memcpy(void *out, const void *in, size_t n) {
-	return memmove(out, in, n);
-	/*bool overtop = false;
-
-	if(n == 0)
-		return 0;
-
-	size_t i;
-	if(in + n > out || out + n > in)
-		overtop = true;
-	
-	if(overtop)
-	{
-		if(out > in)
-		{
-			for(i = n-1; i>=0; i--)
-				*((char*)out + i) = *((char*)in + i);
-		}
-		else
-		{
-			for(i = 0; i < n; i++)
-				*((char*)out + i) = *((char*)in + i);
-		}
+	/* Non-overlapping: forward copy with 8-byte words */
+	uint8_t *d = (uint8_t *)out;
+	const uint8_t *s = (const uint8_t *)in;
+	/* Align dst */
+	while (n > 0 && ((uintptr_t)d & 7)) { *d++ = *s++; n--; }
+	/* 8-byte copy if src aligned */
+	if (!((uintptr_t)s & 7)) {
+		uint64_t *pd = (uint64_t *)d;
+		const uint64_t *ps = (const uint64_t *)s;
+		while (n >= 8) { *pd++ = *ps++; n -= 8; }
+		d = (uint8_t *)pd; s = (const uint8_t *)ps;
 	}
-	else
-	{
-		for(i = 0; i < n; i++)
-		*((char*)out + i) = *((char*)in + i);
-
-	}*/
+	while (n--) *d++ = *s++;
+	return out;
 }
 
 int memcmp(const void *s1, const void *s2, size_t n) {

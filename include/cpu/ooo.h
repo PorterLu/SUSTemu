@@ -60,9 +60,8 @@ typedef struct {
 
 typedef struct {
     int     valid;
-    IR_Inst ir;
     int     phys_rd;    /* Target physical register (-1 = none)             */
-    int     rob_idx;    /* Corresponding ROB slot                           */
+    int     rob_idx;    /* Corresponding ROB slot (IR is read from rob[])   */
     int     src1_ready; word_t src1_val; int src1_ptag;
     int     src2_ready; word_t src2_val; int src2_ptag;
     int     cycles_rem; /* Remaining execution cycles (counts down to 0)   */
@@ -82,13 +81,14 @@ typedef struct {
 
 /* ── IS→EX and EX→MEM latches (carry phys_rd and rob_idx alongside IR) ──── */
 typedef struct {
-    IR_Inst ir;
+    int     rob_idx;   /* ROB slot; IR is read via ooo.rob[rob_idx].ir (no copy) */
     int     phys_rd;
-    int     rob_idx;
     int     valid;
     int     cycles_rem; /* countdown for multi-cycle MEM stage (loads only) */
     int     mshr_idx;   /* index into ooo.mshr[], or -1 if not using MSHR   */
     int     flushed;    /* 1 = ROB was flushed but MSHR fill should complete */
+    word_t  src1_val;   /* forwarded source values (overrides ROB ir.src*_val) */
+    word_t  src2_val;
 } OOOLatch;
 
 /* ── Statistics ──────────────────────────────────────────────────────────── */
