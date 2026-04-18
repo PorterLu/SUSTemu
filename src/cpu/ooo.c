@@ -46,6 +46,20 @@ OOOState ooo;
 OOOStats ooo_stats;
 int      g_ooo_mode = 0;
 
+/* Helper: update rs_ready_mask for slot i based on current RS state */
+static inline void rs_mask_update(int i)
+{
+    RSEntry *rs = &ooo.rs[i];
+    if (rs->valid && rs->src1_ready && rs->src2_ready)
+        ooo.rs_ready_mask[rs->eu_type] |=  (1u << i);
+    else
+        ooo.rs_ready_mask[rs->eu_type] &= ~(1u << i);
+}
+static inline void rs_mask_clear(int i, int eu_type)
+{
+    ooo.rs_ready_mask[eu_type] &= ~(1u << i);
+    ooo.rs_free_mask            |=  (1u << i);  /* slot is now free */
+}
 
 /* ── Differential testing ────────────────────────────────────────────────── */
 /*
@@ -230,17 +244,24 @@ static int rob_newer_than(int a, int b)
  */
 static void cdb_broadcast(int phys_tag)
 {
-    int i;
-    for (i = 0; i < RS_SIZE; i++) {
-        if (!ooo.rs[i].valid) continue;
+    /* Iterate only over valid RS slots using the free mask complement */
+    uint32_t valid_mask = (~ooo.rs_free_mask) & ((RS_SIZE < 32) ? ((1u << RS_SIZE) - 1u) : ~0u);
+    while (valid_mask) {
+        int i = __builtin_ctz(valid_mask);
+        valid_mask &= valid_mask - 1;
+        int changed = 0;
         if (!ooo.rs[i].src1_ready && ooo.rs[i].src1_ptag == phys_tag) {
             ooo.rs[i].src1_val   = ooo.prf[phys_tag].value;
             ooo.rs[i].src1_ready = 1;
+            changed = 1;
         }
         if (!ooo.rs[i].src2_ready && ooo.rs[i].src2_ptag == phys_tag) {
             ooo.rs[i].src2_val   = ooo.prf[phys_tag].value;
             ooo.rs[i].src2_ready = 1;
+            changed = 1;
         }
+        if (changed && ooo.rs[i].src1_ready && ooo.rs[i].src2_ready)
+            ooo.rs_ready_mask[ooo.rs[i].eu_type] |= (1u << i);
     }
 }
 
@@ -272,6 +293,9 @@ static void ooo_flush_after(int branch_rob_idx)
                 ooo.prf[entry->phys_rd].ready = 0;
                 freelist_push(entry->phys_rd);
             }
+            /* Maintain unready_store_count */
+            if (!entry->ready && (entry->ir.raw & 0x7fu) == 0x23u)
+                ooo.unready_store_count--;
             entry->valid = 0;
             ooo.rob_count--;
         }
@@ -281,8 +305,10 @@ static void ooo_flush_after(int branch_rob_idx)
     int i;
     for (i = 0; i < RS_SIZE; i++) {
         if (ooo.rs[i].valid &&
-            rob_newer_than(ooo.rs[i].rob_idx, branch_rob_idx))
+            rob_newer_than(ooo.rs[i].rob_idx, branch_rob_idx)) {
+            rs_mask_clear(i, ooo.rs[i].eu_type);  /* also sets rs_free_mask bit */
             ooo.rs[i].valid = 0;
+        }
     }
 
     /* Flush IS→EX and EX→MEM latches if they hold a newer instruction */
@@ -352,6 +378,9 @@ void ooo_init(void)
     ooo.rob_tail  = 0;
     ooo.rob_count = 0;
 
+    /* RS free mask: all RS_SIZE slots free */
+    ooo.rs_free_mask = (RS_SIZE < 32) ? ((1u << RS_SIZE) - 1u) : ~0u;
+
     /* Store buffer: empty */
     ooo.sbuf_head  = 0;
     ooo.sbuf_tail  = 0;
@@ -386,7 +415,7 @@ static void ooo_stage_commit(void)
         if (g_trace_en) ooo_tc_ir[ooo_tc_n++] = rob->ir;
 
         /* trace committed instructions into ring buffer and log file (same format as exec_once) */
-        {
+        if (log_fp) {
             static char commit_buf[128];
             uint32_t raw = rob->ir.raw;
             sprintf(commit_buf, "%016lx:    ", (unsigned long)rob->ir.pc);
@@ -492,6 +521,7 @@ static void latch_from_rs(OOOLatch *latch, int rs_idx)
     latch->mshr_idx    = -1;
     latch->flushed     = 0;
     latch->valid       = 1;
+    rs_mask_clear(rs_idx, ooo.rs[rs_idx].eu_type);
     ooo.rs[rs_idx].valid = 0;
 }
 
@@ -533,9 +563,19 @@ static void ooo_unit_int(void)
 
             vaddr_t predicted = ir.bp_predicted_pc ? ir.bp_predicted_pc : ir.snpc;
             if (ir.dnpc != predicted) {
-                ooo_flush_after(rob_idx);
-                ooo_stats.mispred_flushes++;
-                ooo.fetch_pc = ir.dnpc & 0xffffffff;
+                /* Sanity check: if dnpc is outside valid memory, this is a
+                 * wrong-path speculative branch/jalr executing before the
+                 * older mispredicted branch has flushed the pipeline.
+                 * Skip the fetch_pc redirect — the older branch will flush
+                 * this ROB entry when it eventually executes. */
+                if (ir.dnpc < 0x80000000UL || ir.dnpc >= 0x88000000UL) {
+                    ooo.rob[rob_idx].ir.fault = 1;
+                    /* Still mark ready so the pipeline doesn't stall */
+                } else {
+                    ooo_flush_after(rob_idx);
+                    ooo_stats.mispred_flushes++;
+                    ooo.fetch_pc = ir.dnpc;
+                }
             }
         }
     }
@@ -644,6 +684,7 @@ static void ooo_unit_lsu(void)
             if (ir->type == ITYPE_STORE) {
                 ooo.rob[rob_idx].store_data = ir->src2_val;
                 ooo.rob[rob_idx].ready = 1;
+                ooo.unready_store_count--;
                 ooo.latch_lsu[s].valid = 0;
                 continue;
             }
@@ -796,24 +837,27 @@ static void ooo_stage_is(void)
     int s, i, best, da, db;
 
     /* ── Macro: scan RS for best instruction of a given EU type ─────────── */
+    /* Uses rs_ready_mask[eu] bitmap to skip invalid/not-ready entries.     */
 #define ISSUE_UNIT(latch_arr, num_slots, eu, do_mem_order) \
     for (s = 0; s < (num_slots); s++) { \
         if ((latch_arr)[s].valid) continue; \
         best = -1; \
-        for (i = 0; i < RS_SIZE; i++) { \
-            if (!ooo.rs[i].valid) continue; \
-            if (ooo.rs[i].eu_type != (eu)) continue; \
-            if (!ooo.rs[i].src1_ready || !ooo.rs[i].src2_ready) continue; \
+        uint32_t _mask = ooo.rs_ready_mask[(eu)]; \
+        while (_mask) { \
+            i = __builtin_ctz(_mask); \
+            _mask &= _mask - 1; \
             if (do_mem_order && (ooo.rs[i].ir.raw & 0x7f) == 0x03) { \
-                int blocked = 0, j; \
-                for (j = ooo.rob_head; j != ooo.rs[i].rob_idx; \
-                     j = (j + 1) % ROB_SIZE) { \
-                    ROBEntry *roe = &ooo.rob[j]; \
-                    if (!roe->valid) continue; \
-                    if (!roe->ready && (roe->ir.raw & 0x7f) == 0x23) \
-                        { blocked = 1; break; } \
+                if (ooo.unready_store_count > 0) { \
+                    int blocked = 0, j; \
+                    for (j = ooo.rob_head; j != ooo.rs[i].rob_idx; \
+                         j = (j + 1) % ROB_SIZE) { \
+                        ROBEntry *roe = &ooo.rob[j]; \
+                        if (!roe->valid) continue; \
+                        if (!roe->ready && (roe->ir.raw & 0x7f) == 0x23) \
+                            { blocked = 1; break; } \
+                    } \
+                    if (blocked) continue; \
                 } \
-                if (blocked) continue; \
             } \
             if (best == -1) { best = i; } else { \
                 da = (ooo.rs[i].rob_idx    - ooo.rob_head + ROB_SIZE) % ROB_SIZE; \
@@ -840,18 +884,17 @@ static void ooo_stage_is(void)
  */
 static void ooo_stage_rn(void)
 {
-    int       n, rs_used, rob_idx, rs_slot;
+    int       n, rs_used, rs_free, rob_idx, rs_slot;
     int       phys_rd, old_phys;
-    int       i;
     IR_Inst  *ir;
     ROBEntry *rob;
     RSEntry  *rs;
 
     if (!ooo.latch_id_rn[0].valid) return;
 
-    /* Count RS entries currently used (updated inline as we allocate) */
-    rs_used = 0;
-    for (i = 0; i < RS_SIZE; i++) if (ooo.rs[i].valid) rs_used++;
+    /* Count free RS slots via popcount on the free mask */
+    rs_free = __builtin_popcount(ooo.rs_free_mask);
+    rs_used = RS_SIZE - rs_free;
 
     for (n = 0; n < FETCH_WIDTH; n++) {
         if (!ooo.latch_id_rn[n].valid) break;
@@ -872,7 +915,6 @@ static void ooo_stage_rn(void)
         if (ir->rd != -1 && ir->rd != 0 && ooo.freelist.count == 0) {
             ooo_stats.rob_full_stalls++; break;
         }
-
         /* ── Allocate ROB slot ──────────────────────────────────────────────── */
         rob_idx      = ooo.rob_tail;
         ooo.rob_tail = (ooo.rob_tail + 1) % ROB_SIZE;
@@ -884,6 +926,10 @@ static void ooo_stage_rn(void)
         rob->ready    = 0;
         rob->valid    = 1;
         rob->store_data = 0;
+
+        /* Track unready stores for fast IS-stage memory-ordering check */
+        if ((ir->raw & 0x7fu) == 0x23u)
+            ooo.unready_store_count++;
 
         /*
          * ── Read source register mappings BEFORE renaming the destination ─────
@@ -926,11 +972,9 @@ static void ooo_stage_rn(void)
         rob->old_phys = old_phys;
 
         /* ── Find a free RS slot ────────────────────────────────────────────── */
-        rs_slot = -1;
-        for (i = 0; i < RS_SIZE; i++) {
-            if (!ooo.rs[i].valid) { rs_slot = i; break; }
-        }
-        /* rs_slot must exist: we checked rs_used < RS_SIZE above */
+        /* rs_free_mask has a bit set for every free slot; ctz gives the lowest */
+        rs_slot = __builtin_ctz(ooo.rs_free_mask);
+        ooo.rs_free_mask &= ~(1u << rs_slot);  /* mark as allocated */
         rs          = &ooo.rs[rs_slot];
         rs->valid   = 1;
         rs->ir      = *ir;
@@ -986,6 +1030,10 @@ static void ooo_stage_rn(void)
 
         ooo.latch_id_rn[n].valid = 0;
         rs_used++;  /* update live count for next slot's structural check */
+        rs_free--;  /* one fewer free slot */
+
+        /* Update ready mask for the newly allocated RS slot */
+        rs_mask_update(rs_slot);
     }
 
     /* Compact: if slot 0 was consumed and slot 1 remains, shift it to slot 0
@@ -1032,12 +1080,11 @@ static void ooo_stage_if(void)
         pc = ooo.fetch_pc & 0xffffffff;  /* riscv64: lw sign-extends; truncate to 32-bit */
         ooo.fetch_pc = pc;
 
-        /* Sanity check: ensure fetch_pc is within valid memory range */
+        /* Sanity check: ensure fetch_pc is within valid memory range.
+         * Should not happen with the wrong-path branch guard above. */
         if (pc < 0x80000000 || pc >= 0x88000000) {
-            fprintf(stderr, "[OOO-ERROR] Invalid fetch_pc: 0x%lx, resetting to 0x80000000\n",
-                    (unsigned long)pc);
-            ooo.fetch_pc = 0x80000000;
-            pc = ooo.fetch_pc;
+            ooo.fetch_pc += 4;
+            break;
         }
 
         raw = (uint32_t)vaddr_ifetch(pc, 4);

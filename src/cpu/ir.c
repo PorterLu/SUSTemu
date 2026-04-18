@@ -178,7 +178,8 @@ static void ir_fill_operands(IR_Inst *ir, uint32_t i, int type)
 
 void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir)
 {
-    /* Initialise all fields to safe defaults */
+    /* Zero everything first, then set non-zero defaults */
+    memset(ir, 0, sizeof(*ir));
     ir->pc              = pc;
     ir->snpc            = snpc;
     ir->raw             = raw;
@@ -187,19 +188,7 @@ void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir)
     ir->rd              = -1;
     ir->rs1             = -1;
     ir->rs2             = -1;
-    ir->src1_val        = 0;
-    ir->src2_val        = 0;
-    ir->imm             = 0;
-    ir->mem_addr        = 0;
-    ir->mem_width       = 0;
-    ir->mem_sign        = 0;
-    ir->result          = 0;
     ir->dnpc            = snpc;   /* default: sequential */
-    ir->taken           = 0;
-    ir->bp_predict_taken = 0;
-    ir->bp_predicted_pc  = 0;
-    ir->serializing     = 0;
-    ir->fault           = 0;
     ir->phys_rd         = -1;
     ir->rob_idx         = -1;
     ir->exec_fn         = ir_exec_inv;

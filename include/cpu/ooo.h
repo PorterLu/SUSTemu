@@ -133,6 +133,16 @@ typedef struct {
 
     /* Reservation stations */
     RSEntry  rs[RS_SIZE];
+    int      unready_store_count; /* # of STOREs in ROB with ready=0; maintained
+                                   * incrementally to avoid O(ROB) scan per LOAD */
+    /* Per-EU-type bitmask of RS slots that are valid AND have both sources ready.
+     * Bit i set ↔ rs[i].valid && src1_ready && src2_ready && eu_type == EU_x.
+     * Maintained by CDB broadcast, issue, flush, and rename. Lets IS stage
+     * skip invalid/not-ready entries without scanning all RS_SIZE slots. */
+    uint32_t rs_ready_mask[3];  /* [EU_INT], [EU_MUL], [EU_LSU] */
+    /* Bitmask of FREE RS slots (bit i set ↔ rs[i].valid == 0).
+     * Maintained incrementally; replaces O(RS_SIZE) scan in RN and cdb_broadcast. */
+    uint32_t rs_free_mask;
 
     /* Pipeline latches: front-end FETCH_WIDTH-wide, back-end per functional unit */
     PipeReg  latch_if_id[FETCH_WIDTH];          /* IF → ID                   */

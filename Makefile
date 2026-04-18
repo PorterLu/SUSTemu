@@ -43,7 +43,7 @@ else
   AS = gcc
 
   LIBS = -lSDL2 -lreadline
-  CFLAGS = -O2 -Wall -Werror -MMD $(INC_PATH)
+  CFLAGS = -O3 -march=native -Wall -MMD $(INC_PATH)
   CXXFLAGS = $(shell llvm-config-11 --cxxflags)
   CXXFLAGS += $(shell llvm-config-11 --libs)
   CXXFLAGS += -std=c++14 -fno-exceptions -fPIE

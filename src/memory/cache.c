@@ -36,6 +36,7 @@ Cache* init_cache(int s, int w, char *name) {
     c->sets = (CacheSet *)malloc(S * sizeof(CacheSet));
     for (int i = 0; i < S; i++) {
         c->sets[i].lines = (CacheLine *)calloc(w, sizeof(CacheLine));
+        c->sets[i].mru_way = -1;
     }
     return c;
 }
@@ -50,11 +51,21 @@ static CacheLine* find_line(Cache *c, paddr_t addr, int *is_hit) {
     int lru_idx = 0;
     uint64_t min_time = UINT64_MAX;
 
+    /* Fast path: check MRU way first */
+    int mru = set->mru_way;
+    if (mru >= 0 && set->lines[mru].valid && set->lines[mru].tag == tag) {
+        *is_hit = 1;
+        c->hits++;
+        set->lines[mru].last_access = c->timer;
+        return &set->lines[mru];
+    }
+
     for (int i = 0; i < c->w; i++) {
         if (set->lines[i].valid && set->lines[i].tag == tag) {
             *is_hit = 1;
             c->hits++;
             set->lines[i].last_access = c->timer;
+            set->mru_way = i;
             return &set->lines[i];
         }
         if (set->lines[i].last_access < min_time) {
@@ -136,9 +147,18 @@ static CacheLine* find_line_quiet(Cache *c, paddr_t addr, int *is_hit) {
     CacheSet *set = &c->sets[set_idx];
     int lru_idx = 0;
     uint64_t min_time = UINT64_MAX;
+
+    /* Fast path: check MRU way first */
+    int mru = set->mru_way;
+    if (mru >= 0 && set->lines[mru].valid && set->lines[mru].tag == tag) {
+        *is_hit = 1;
+        return &set->lines[mru];
+    }
+
     for (int i = 0; i < c->w; i++) {
         if (set->lines[i].valid && set->lines[i].tag == tag) {
             *is_hit = 1;
+            set->mru_way = i;
             return &set->lines[i];
         }
         if (set->lines[i].last_access < min_time) {
