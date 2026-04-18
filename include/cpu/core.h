@@ -53,7 +53,7 @@ typedef struct {
     Cache    *l1d;
 
     /* ── Per-core in-order pipeline state ─────────────────── */
-    Pipeline  pipe;
+    Pipeline  cpu_pipe;
     PipeStats pipe_stats;
 
     /* ── Per-core out-of-order engine state ───────────────── */

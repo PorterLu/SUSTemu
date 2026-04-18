@@ -4,6 +4,10 @@
 #include <mmio.h>
 #include <debug.h>
 
+/* macOS SDK defines _KEY_T as a header guard; undefine it to avoid
+ * colliding with our _KEY_NAME(T) → _KEY_T enum token. */
+#undef _KEY_T
+
 #define KEYDOWN_MASK 0x8000
 #define CONFIG_I8042_DATA_MMIO 0xa0000060
 /**********************************Keymap生成********************************************

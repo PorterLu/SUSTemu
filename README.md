@@ -40,9 +40,24 @@ A RISC-V simulator for computer architecture education, based on the RV64-IM ISA
 ## Building and Running
 
 ### Dependencies
+
+#### Ubuntu / Linux
 ```
 gcc / g++   llvm-11 (for disassembly)   make
+libSDL2-dev   libreadline-dev
 ```
+
+#### macOS (Apple Silicon / Intel)
+Install dependencies via Homebrew:
+```bash
+brew install llvm sdl2 readline riscv-gnu-toolchain python3
+pip3 install kconfiglib
+```
+
+**Notes for macOS:**
+- The build system auto-detects macOS (`uname -s`) and switches to `clang`/`clang++` with Homebrew paths.
+- LLVM 20+ is supported (the disassembler code is compatible with LLVM ≥ 11).
+- `kconfiglib` replaces the Linux-specific `mconf`/`conf` tools for `make menuconfig`.
 
 ### Build
 ```bash

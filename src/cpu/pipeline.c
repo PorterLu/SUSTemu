@@ -40,7 +40,7 @@
 #include <exec_cfg.h>
 
 /* ── Global pipeline state ──────────────────────────────────────────────── */
-Pipeline  pipe;
+Pipeline  cpu_pipe;
 PipeStats pipe_stats;
 
 /* ── Forward declarations ───────────────────────────────────────────────── */
@@ -55,12 +55,12 @@ static void pipeline_trace_cycle(void);
 
 void pipeline_init(void)
 {
-    pipe.id.valid   = 0;
-    pipe.ex.valid   = 0;
-    pipe.mem.valid  = 0;
-    pipe.wb.valid   = 0;
-    pipe.fetch_pc   = cpu.pc;
-    pipe.mem_stall_rem = 0;
+    cpu_pipe.id.valid   = 0;
+    cpu_pipe.ex.valid   = 0;
+    cpu_pipe.mem.valid  = 0;
+    cpu_pipe.wb.valid   = 0;
+    cpu_pipe.fetch_pc   = cpu.pc;
+    cpu_pipe.mem_stall_rem = 0;
 
     pipe_stats.cycles          = 0;
     pipe_stats.insts           = 0;
@@ -77,15 +77,15 @@ void pipeline_init(void)
  * (WB first, IF last) so that each stage sees the latch values written by
  * the *previous* cycle's upstream stage, not the current cycle's.
  *
- * When a cache miss is detected in stage_MEM, pipe.mem_stall_rem is set to
+ * When a cache miss is detected in stage_MEM, cpu_pipe.mem_stall_rem is set to
  * the remaining wait cycles.  For those cycles the pipeline is fully frozen
  * (no stage runs) — the completed load sits in the WB latch until the stall
  * expires, at which point stage_WB retires it normally.
  */
 void pipeline_cycle(void)
 {
-    if (pipe.mem_stall_rem > 0) {
-        pipe.mem_stall_rem--;
+    if (cpu_pipe.mem_stall_rem > 0) {
+        cpu_pipe.mem_stall_rem--;
         pipe_stats.cycles++;
         g_sim_cycles++;
         pipeline_trace_cycle();
@@ -106,10 +106,10 @@ void pipeline_cycle(void)
 
 static void stage_WB(void)
 {
-    if (!pipe.wb.valid)
+    if (!cpu_pipe.wb.valid)
         return;
 
-    IR_Inst *ir = &pipe.wb.ir;
+    IR_Inst *ir = &cpu_pipe.wb.ir;
 
     /* Commit GPR result */
     ir_writeback(ir, &cpu);
@@ -118,7 +118,7 @@ static void stage_WB(void)
     cpu.pc = ir->dnpc;
 
     pipe_stats.insts++;
-    pipe.wb.valid = 0;
+    cpu_pipe.wb.valid = 0;
 }
 
 /* ── stage_MEM ──────────────────────────────────────────────────────────── */
@@ -126,24 +126,24 @@ static void stage_WB(void)
 static void stage_MEM(void)
 {
     /* Transfer EX→MEM latch into WB latch before processing MEM */
-    pipe.wb = pipe.mem;
+    cpu_pipe.wb = cpu_pipe.mem;
 
-    if (pipe.mem.valid) {
+    if (cpu_pipe.mem.valid) {
         int lat = 0;
-        ir_mem_access(&pipe.mem.ir, &lat);   /* fills ir->result for loads */
+        ir_mem_access(&cpu_pipe.mem.ir, &lat);   /* fills ir->result for loads */
         /* Copy the result (may be a loaded value) into the WB latch */
-        pipe.wb.ir.result = pipe.mem.ir.result;
+        cpu_pipe.wb.ir.result = cpu_pipe.mem.ir.result;
 
         /* If this is a load that missed the L1, stall the pipeline for the
          * remaining cache latency.  The WB latch is already populated with
          * the correct result; it will be committed after the stall expires. */
-        if (lat > 1 && pipe.mem.ir.type == ITYPE_LOAD) {
-            pipe.mem_stall_rem = lat - 1;
+        if (lat > 1 && cpu_pipe.mem.ir.type == ITYPE_LOAD) {
+            cpu_pipe.mem_stall_rem = lat - 1;
             pipe_stats.stall_cache_miss += (uint64_t)(lat - 1);
         }
     }
 
-    pipe.mem.valid = 0;
+    cpu_pipe.mem.valid = 0;
 }
 
 /* ── stage_EX ───────────────────────────────────────────────────────────── */
@@ -151,16 +151,16 @@ static void stage_MEM(void)
 static void stage_EX(void)
 {
     /* Pass ID→EX latch to EX→MEM */
-    pipe.mem = pipe.ex;
+    cpu_pipe.mem = cpu_pipe.ex;
 
-    if (pipe.ex.valid) {
-        IR_Inst *ir = &pipe.ex.ir;
+    if (cpu_pipe.ex.valid) {
+        IR_Inst *ir = &cpu_pipe.ex.ir;
 
         ir_execute(ir, &cpu);   /* ALU + address compute (no mem access) */
         if (ir->fault) INV(ir->pc);  /* in-order: raise invalid-instruction immediately */
 
         /* Propagate result into MEM latch */
-        pipe.mem.ir = *ir;
+        cpu_pipe.mem.ir = *ir;
 
         if (g_bpred_mode) {
             /* ── Branch predictor update + misprediction recovery ────────
@@ -172,8 +172,8 @@ static void stage_EX(void)
              */
             bpred_update(&bpred, ir);
             if (ir->dnpc != ir->bp_predicted_pc) {
-                pipe.id.valid = 0;          /* flush wrongly-speculated IF/ID */
-                pipe.fetch_pc = ir->dnpc;   /* redirect to correct PC         */
+                cpu_pipe.id.valid = 0;          /* flush wrongly-speculated IF/ID */
+                cpu_pipe.fetch_pc = ir->dnpc;   /* redirect to correct PC         */
             }
         } else {
             /* ── Control hazard (no predictor) ──────────────────────────
@@ -181,24 +181,24 @@ static void stage_EX(void)
              * flushing the ID latch (one wrongly-fetched instruction).
              */
             if (ir->dnpc != ir->snpc) {
-                pipe.id.valid  = 0;
-                pipe.fetch_pc  = ir->dnpc;
+                cpu_pipe.id.valid  = 0;
+                cpu_pipe.fetch_pc  = ir->dnpc;
                 pipe_stats.stall_control++;
             }
         }
     }
 
-    pipe.ex.valid = 0;
+    cpu_pipe.ex.valid = 0;
 }
 
 static void stage_ID(void)
 {
-    if (!pipe.id.valid) {
-        pipe.ex.valid = 0;
+    if (!cpu_pipe.id.valid) {
+        cpu_pipe.ex.valid = 0;
         return;
     }
 
-    IR_Inst *ir = &pipe.id.ir;
+    IR_Inst *ir = &cpu_pipe.id.ir;
 
     /*
      * Re-read rs1/rs2 from the register file.
@@ -216,39 +216,39 @@ static void stage_ID(void)
 
     /*
      * After WB, MEM, EX have run this cycle:
-     *   pipe.mem = instruction that was in EX (just executed by stage_EX)
-     *   pipe.wb  = instruction that was in MEM (just memory-accessed by stage_MEM)
+     *   cpu_pipe.mem = instruction that was in EX (just executed by stage_EX)
+     *   cpu_pipe.wb  = instruction that was in MEM (just memory-accessed by stage_MEM)
      *
-     * Load-use hazard: if the EX instruction (now pipe.mem) is a LOAD writing
+     * Load-use hazard: if the EX instruction (now cpu_pipe.mem) is a LOAD writing
      * a register ID needs, we cannot forward (result not yet available) → stall.
      */
-    if (pipe.mem.valid
-        && pipe.mem.ir.type == ITYPE_LOAD
-        && pipe.mem.ir.rd > 0
-        && (pipe.mem.ir.rd == ir->rs1 || pipe.mem.ir.rd == ir->rs2)) {
+    if (cpu_pipe.mem.valid
+        && cpu_pipe.mem.ir.type == ITYPE_LOAD
+        && cpu_pipe.mem.ir.rd > 0
+        && (cpu_pipe.mem.ir.rd == ir->rs1 || cpu_pipe.mem.ir.rd == ir->rs2)) {
         pipe_stats.stall_load_use++;
         return;   /* id.valid == 1: stage_IF stalls too */
     }
 
     /*
      * Forwarding (overrides register-file read above):
-     *   pipe.wb  → 2-cycle-ahead result (was in MEM: includes load results)
-     *   pipe.mem → 1-cycle-ahead result (was in EX: ALU/JAL/etc, not LOAD)
+     *   cpu_pipe.wb  → 2-cycle-ahead result (was in MEM: includes load results)
+     *   cpu_pipe.mem → 1-cycle-ahead result (was in EX: ALU/JAL/etc, not LOAD)
      * Apply WB first (older), then MEM (newer, takes priority).
      */
-    if (pipe.wb.valid && pipe.wb.ir.rd > 0) {
-        if (pipe.wb.ir.rd == ir->rs1) ir->src1_val = pipe.wb.ir.result;
-        if (pipe.wb.ir.rd == ir->rs2) ir->src2_val = pipe.wb.ir.result;
+    if (cpu_pipe.wb.valid && cpu_pipe.wb.ir.rd > 0) {
+        if (cpu_pipe.wb.ir.rd == ir->rs1) ir->src1_val = cpu_pipe.wb.ir.result;
+        if (cpu_pipe.wb.ir.rd == ir->rs2) ir->src2_val = cpu_pipe.wb.ir.result;
     }
-    if (pipe.mem.valid && pipe.mem.ir.rd > 0
-        && pipe.mem.ir.type != ITYPE_LOAD) {
-        if (pipe.mem.ir.rd == ir->rs1) ir->src1_val = pipe.mem.ir.result;
-        if (pipe.mem.ir.rd == ir->rs2) ir->src2_val = pipe.mem.ir.result;
+    if (cpu_pipe.mem.valid && cpu_pipe.mem.ir.rd > 0
+        && cpu_pipe.mem.ir.type != ITYPE_LOAD) {
+        if (cpu_pipe.mem.ir.rd == ir->rs1) ir->src1_val = cpu_pipe.mem.ir.result;
+        if (cpu_pipe.mem.ir.rd == ir->rs2) ir->src2_val = cpu_pipe.mem.ir.result;
     }
 
     /* Move ID → EX */
-    pipe.ex      = pipe.id;
-    pipe.id.valid = 0;
+    cpu_pipe.ex      = cpu_pipe.id;
+    cpu_pipe.id.valid = 0;
 }
 
 /* ── stage_IF ───────────────────────────────────────────────────────────── */
@@ -257,29 +257,29 @@ static void stage_IF(void)
 {
     /* If the ID latch is still occupied (load-use stall), we cannot
      * place a new instruction there — stall the fetch stage. */
-    if (pipe.id.valid)
+    if (cpu_pipe.id.valid)
         return;
 
     /* Normal fetch: read instruction from memory and decode into ID latch */
-    vaddr_t  pc  = pipe.fetch_pc;
+    vaddr_t  pc  = cpu_pipe.fetch_pc;
     uint32_t raw = (uint32_t)vaddr_ifetch(pc, 4);
-    ir_decode(raw, pc, pc + 4, &pipe.id.ir);
-    pipe.id.valid  = 1;
-    pipe.fetch_pc  = pc + 4;   /* default sequential; EX may override on mispredict */
+    ir_decode(raw, pc, pc + 4, &cpu_pipe.id.ir);
+    cpu_pipe.id.valid  = 1;
+    cpu_pipe.fetch_pc  = pc + 4;   /* default sequential; EX may override on mispredict */
 
     if (g_bpred_mode) {
         /* Query predictor and annotate the instruction for EX to verify */
         BPredResult r = bpred_predict(&bpred, pc);
-        pipe.id.ir.bp_predict_taken = r.taken;
-        pipe.id.ir.bp_predicted_pc  = (r.taken && r.btb_hit) ? r.target : pc + 4;
+        cpu_pipe.id.ir.bp_predict_taken = r.taken;
+        cpu_pipe.id.ir.bp_predicted_pc  = (r.taken && r.btb_hit) ? r.target : pc + 4;
         /* Speculative redirect: if we predict taken and have a BTB target,
          * fetch from the predicted target next cycle. */
         if (r.taken && r.btb_hit)
-            pipe.fetch_pc = r.target;
+            cpu_pipe.fetch_pc = r.target;
     } else {
         /* No predictor: always predict not-taken (pc+4) */
-        pipe.id.ir.bp_predict_taken = 0;
-        pipe.id.ir.bp_predicted_pc  = pc + 4;
+        cpu_pipe.id.ir.bp_predict_taken = 0;
+        cpu_pipe.id.ir.bp_predicted_pc  = pc + 4;
     }
 }
 
@@ -313,10 +313,10 @@ static void pipeline_trace_cycle(void)
 } while (0)
 
     fprintf(log_fp, "[C=%6" PRIu64 "]", pipe_stats.cycles);
-    TP("ID",  pipe.id);
-    TP("EX",  pipe.ex);
-    TP("MEM", pipe.mem);
-    TP("WB",  pipe.wb);
+    TP("ID",  cpu_pipe.id);
+    TP("EX",  cpu_pipe.ex);
+    TP("MEM", cpu_pipe.mem);
+    TP("WB",  cpu_pipe.wb);
     fprintf(log_fp, "\n");
     fflush(log_fp);
 
@@ -353,20 +353,20 @@ void pipeline_report(void)
 void pipeline_init_core(Core *c)
 {
     /* Swap globals to this core's state */
-    Pipeline  save_pipe  = pipe;
+    Pipeline  save_pipe  = cpu_pipe;
     PipeStats save_stats = pipe_stats;
 
-    pipe       = c->pipe;
+    cpu_pipe       = c->cpu_pipe;
     pipe_stats = c->pipe_stats;
 
     /* pipeline_init() reads cpu.pc (already loaded by core_cycle) */
     /* Init latches and fetch_pc */
-    pipe.id.valid   = 0;
-    pipe.ex.valid   = 0;
-    pipe.mem.valid  = 0;
-    pipe.wb.valid   = 0;
-    pipe.fetch_pc   = cpu.pc;
-    pipe.mem_stall_rem = 0;
+    cpu_pipe.id.valid   = 0;
+    cpu_pipe.ex.valid   = 0;
+    cpu_pipe.mem.valid  = 0;
+    cpu_pipe.wb.valid   = 0;
+    cpu_pipe.fetch_pc   = cpu.pc;
+    cpu_pipe.mem_stall_rem = 0;
 
     pipe_stats.cycles          = 0;
     pipe_stats.insts           = 0;
@@ -376,10 +376,10 @@ void pipeline_init_core(Core *c)
 
     if (c->bpred_enabled) bpred_init(&c->bpred);
 
-    c->pipe       = pipe;
+    c->cpu_pipe       = cpu_pipe;
     c->pipe_stats = pipe_stats;
 
-    pipe       = save_pipe;
+    cpu_pipe       = save_pipe;
     pipe_stats = save_stats;
 }
 
@@ -391,19 +391,19 @@ void pipeline_init_core(Core *c)
 void pipeline_cycle_core(Core *c)
 {
     /* Install this core's state into the legacy globals */
-    Pipeline       save_pipe  = pipe;
+    Pipeline       save_pipe  = cpu_pipe;
     PipeStats      save_stats = pipe_stats;
     BranchPredictor save_bp   = bpred;
 
-    pipe       = c->pipe;
+    cpu_pipe       = c->cpu_pipe;
     pipe_stats = c->pipe_stats;
     bpred      = c->bpred;
 
     /* Update caches used by vmem (core_cycle already set L1I/L1D) */
 
     /* Run the 5 stages (with cache-miss stall support) */
-    if (pipe.mem_stall_rem > 0) {
-        pipe.mem_stall_rem--;
+    if (cpu_pipe.mem_stall_rem > 0) {
+        cpu_pipe.mem_stall_rem--;
     } else {
         stage_WB();
         stage_MEM();
@@ -418,12 +418,12 @@ void pipeline_cycle_core(Core *c)
     c->sim_instret = pipe_stats.insts;
 
     /* Save back to core */
-    c->pipe       = pipe;
+    c->cpu_pipe       = cpu_pipe;
     c->pipe_stats = pipe_stats;
     c->bpred      = bpred;
 
     /* Restore single-core globals */
-    pipe       = save_pipe;
+    cpu_pipe       = save_pipe;
     pipe_stats = save_stats;
     bpred      = save_bp;
 }

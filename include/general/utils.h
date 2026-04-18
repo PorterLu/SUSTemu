@@ -1,5 +1,5 @@
 #ifndef __UTILS_H__
-#define __UTILS_h__
+#define __UTILS_H__
 
 #define ANSI_FG_RED 	"\33[1;31m"
 #define ANSI_FG_GREEN 	"\33[1;32m"

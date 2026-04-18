@@ -15,25 +15,48 @@ INC_PATH := $(abspath $(shell find ./include -maxdepth 1))
 INC_PATH := $(filter-out  $(abspath ./include/config), $(INC_PATH))
 INC_PATH += $(abspath ./include/generated)
 
-CXX = g++
-CC = gcc
-LD = g++
-AS = gcc
+UNAME_S := $(shell uname -s)
+
+ifeq ($(UNAME_S),Darwin)
+  CXX = clang++
+  CC = clang
+  LD = clang++
+  AS = clang
+  LLVM_CONFIG = /opt/homebrew/opt/llvm/bin/llvm-config
+  BREW_SDL2 = /opt/homebrew/opt/sdl2
+  BREW_RL   = /opt/homebrew/opt/readline
+
+  LIBS = -lSDL2 -lreadline
+  CFLAGS = -O2 -Wall -Werror -Wno-format -MMD $(INC_PATH)
+  CFLAGS += -I$(BREW_SDL2)/include -I$(BREW_RL)/include
+  CXXFLAGS = $(shell $(LLVM_CONFIG) --cxxflags)
+  CXXFLAGS += -fno-exceptions -fPIE
+  CXXFLAGS += $(CFLAGS)
+  ASFLAGS = -MMD -O0 $(INC_PATH)
+  LDFLAGS = -O2 -L$(BREW_SDL2)/lib -L$(BREW_RL)/lib $(LIBS)
+  LDFLAGS += $(shell $(LLVM_CONFIG) --ldflags)
+  LDFLAGS += $(shell $(LLVM_CONFIG) --libs)
+else
+  CXX = g++
+  CC = gcc
+  LD = g++
+  AS = gcc
+
+  LIBS = -lSDL2 -lreadline
+  CFLAGS = -O2 -Wall -Werror -MMD $(INC_PATH)
+  CXXFLAGS = $(shell llvm-config-11 --cxxflags)
+  CXXFLAGS += $(shell llvm-config-11 --libs)
+  CXXFLAGS += -std=c++14 -fno-exceptions -fPIE
+  CXXFLAGS += $(CFLAGS)
+  ASFLAGS = -MMD -O0 $(INC_PATH)
+  LDFLAGS = -O2 $(LIBS) -lLLVM-11
+endif
 
 INC_PATH := $(addprefix -I,$(INC_PATH))
 
-LOG_FILE = log.txt 
-IMG_FILE = os_test/os.elf 
+LOG_FILE = log.txt
+IMG_FILE = os_test/os.elf
 IMG_BIN = os_test/os.bin
-
-LIBS = -lSDL2 -lreadline
-CFLAGS = -O2 -Wall -Werror -MMD $(INC_PATH) 
-CXXFLAGS = $(shell llvm-config-11 --cxxflags) 
-CXXFLAGS +=  $(shell llvm-config-11 --libs) 
-CXXFLAGS += -std=c++14  -fno-exceptions -fPIE
-CXXFLAGS += $(CFLAGS)
-ASFLAGS = -MMD -O0 $(INC_PATH)
-LDFLAGS = -O2 $(LIBS) -lLLVM-11
 
 all: $(TARGET)
 	@echo $< over
@@ -99,11 +122,11 @@ run-mario: all $(LITENES_BIN)
 run-mario-difftest: all $(LITENES_BIN)
 	DISPLAY=:0 ./build/sustemu --ooo --bpred --difftest -b -e $(LITENES_ELF) $(LITENES_BIN)
 $(TARGET): $(OBJS)
-	@$(LD) -o $@ $(OBJS) $(LDFLAGS) $(LIBS) 
+	@$(LD) -o $@ $(OBJS) $(LDFLAGS) 
 
 $(OBJ_DIR)/%.o: %.c
 	mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(LIBS) -c -o $@ $<
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(OBJ_DIR)/%.o: %.cc
 	mkdir -p $(dir $@)
@@ -117,15 +140,20 @@ run: $(TARGET)
 	$(TARGET) -l $(LOG_FILE) -e $(IMG_FILE) $(IMG_BIN)
 
 clean:
-	rm $(OBJ_DIR) -rf
-	find ./ -name "*.o" | xargs rm -rf
-	find ./ -name "*.d" | xargs rm -rf
-	rm $(LOG_FILE) -rf
-	make -C ./test clean
+	rm -rf $(OBJ_DIR)
+	find ./ -name "*.o" -delete
+	find ./ -name "*.d" -delete
+	rm -rf $(LOG_FILE)
+	make -C ./test clean 2>/dev/null || true
 
 menuconfig:
 	mkdir -p ./build
+ifeq ($(UNAME_S),Darwin)
+	menuconfig Kconfig
+	python3 -c "from kconfiglib import Kconfig; k=Kconfig('Kconfig'); k.load_config('.config'); k.write_autoconf('include/generated/autoconf.h')"
+else
 	mconf Kconfig
 	conf --syncconfig Kconfig
+endif
 
 -include $(CSRCS:%.c=%.d) $(CXXSRCS:%.cc=%.d) $(ASRCS:%.S=%.d)

@@ -9,6 +9,7 @@
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCDisassembler/MCDisassembler.h"
 #include "llvm/MC/MCInstPrinter.h"
+#include "llvm/MC/MCSubtargetInfo.h"
 #if LLVM_VERSION_MAJOR >= 14
 #include "llvm/MC/TargetRegistry.h"
 #else

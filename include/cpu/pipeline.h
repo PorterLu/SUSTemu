@@ -40,7 +40,7 @@ typedef struct {
 } PipeStats;
 
 /* ── Globals (defined in pipeline.c) ───────────────────────────────────── */
-extern Pipeline  pipe;
+extern Pipeline  cpu_pipe;
 extern PipeStats pipe_stats;
 
 /* ── API ────────────────────────────────────────────────────────────────── */
