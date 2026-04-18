@@ -179,8 +179,9 @@ static void ir_fill_operands(IR_Inst *ir, uint32_t i, int type)
 
 void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir)
 {
-    /* Zero everything first, then set non-zero defaults */
-    memset(ir, 0, sizeof(*ir));
+    /* Initialise only fields that callers read before exec_fn writes them.
+     * Avoid memset(160B) — most fields are written by exec_fn before they
+     * are ever read, so clearing them is wasted work. */
     ir->pc              = pc;
     ir->snpc            = snpc;
     ir->raw             = raw;
@@ -190,8 +191,14 @@ void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir)
     ir->rs1             = -1;
     ir->rs2             = -1;
     ir->dnpc            = snpc;   /* default: sequential */
+    ir->taken           = 0;
+    ir->mem_addr        = 0;
+    ir->mem_width       = 0;
+    ir->serializing     = 0;
+    ir->fault           = 0;
     ir->phys_rd         = -1;
     ir->rob_idx         = -1;
+    ir->cycles_rem      = 0;
     ir->exec_fn         = ir_exec_inv;
 
     /* Pattern-match using the shared instruction table.
