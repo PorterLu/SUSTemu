@@ -84,13 +84,19 @@ bench-dual: all
 	@echo "=== Dual-core OOO + bpred — each hart runs independent Dhrystone ==="
 	./build/sustemu -b --ooo --bpred --dual -e ./test/dual/dual.elf -l /dev/null ./test/dual/dual.bin
 
-LITENES_ELF ?= /home/porterlu/academic/ysyx/am-kernels/kernels/litenes/build/litenes-riscv64-nemu.elf
-LITENES_BIN ?= /home/porterlu/academic/ysyx/am-kernels/kernels/litenes/build/litenes-riscv64-nemu.bin
+AM_HOME    = $(PWD)/am
+LITENES_DIR = $(PWD)/litenes
+LITENES_ELF = $(LITENES_DIR)/build/litenes-riscv64-nemu.elf
+LITENES_BIN = $(LITENES_DIR)/build/litenes-riscv64-nemu.bin
 
-run-mario: all
+$(LITENES_ELF): $(LITENES_BIN)
+$(LITENES_BIN):
+	AM_HOME=$(AM_HOME) make -C $(LITENES_DIR) ARCH=riscv64-nemu
+
+run-mario: all $(LITENES_BIN)
 	DISPLAY=:0 ./build/sustemu --ooo --bpred -b -e $(LITENES_ELF) $(LITENES_BIN)
 
-run-mario-difftest: all
+run-mario-difftest: all $(LITENES_BIN)
 	DISPLAY=:0 ./build/sustemu --ooo --bpred --difftest -b -e $(LITENES_ELF) $(LITENES_BIN)
 $(TARGET): $(OBJS)
 	@$(LD) -o $@ $(OBJS) $(LDFLAGS) $(LIBS) 
