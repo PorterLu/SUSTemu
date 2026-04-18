@@ -21,6 +21,7 @@
 #include <vmem.h>
 #include <state.h>
 #include <elftl.h>
+#include <string.h>
 #include <exec_cfg.h>
 
 /* ── Forward declarations of per-instruction executor functions ─────────── */
