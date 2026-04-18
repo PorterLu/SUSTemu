@@ -1,4 +1,4 @@
-.PHONY: all run clean menuconfig bench bench-functional bench-inorder bench-bpred bench-ooo bench-dhrystone bench-dual
+.PHONY: all run clean menuconfig bench bench-functional bench-inorder bench-bpred bench-ooo bench-dhrystone bench-dual run-mario run-mario-difftest
 
 PWD = $(shell pwd)
 OBJ_DIR = $(PWD)/build
@@ -84,6 +84,14 @@ bench-dual: all
 	@echo "=== Dual-core OOO + bpred — each hart runs independent Dhrystone ==="
 	./build/sustemu -b --ooo --bpred --dual -e ./test/dual/dual.elf -l /dev/null ./test/dual/dual.bin
 
+LITENES_ELF ?= /home/porterlu/academic/ysyx/am-kernels/kernels/litenes/build/litenes-riscv64-nemu.elf
+LITENES_BIN ?= /home/porterlu/academic/ysyx/am-kernels/kernels/litenes/build/litenes-riscv64-nemu.bin
+
+run-mario: all
+	DISPLAY=:0 ./build/sustemu --ooo --bpred -b -e $(LITENES_ELF) $(LITENES_BIN)
+
+run-mario-difftest: all
+	DISPLAY=:0 ./build/sustemu --ooo --bpred --difftest -b -e $(LITENES_ELF) $(LITENES_BIN)
 $(TARGET): $(OBJS)
 	@$(LD) -o $@ $(OBJS) $(LDFLAGS) $(LIBS) 
 

@@ -103,6 +103,20 @@ typedef struct {
     uint64_t branch_penalty_cycles; /* Total ROB entries flushed on mispredicts */
 } OOOStats;
 
+/* ── Per-core store buffer (TSO model) ──────────────────────────────────── */
+/* Committed stores are buffered here and drain to cache one per cycle.
+ * Other cores cannot see the store until it drains (globally visible).
+ * Same-core LOADs check this buffer first (STLF for committed stores).
+ * FENCE stalls commit until the buffer is empty. */
+#define STORE_BUF_SIZE 16
+
+typedef struct {
+    vaddr_t addr;
+    word_t  data;
+    int     width;
+    int     valid;
+} StoreBufEntry;
+
 /* ── Top-level OOO engine state ──────────────────────────────────────────── */
 typedef struct {
     /* Physical register file and renaming tables */
@@ -136,6 +150,12 @@ typedef struct {
     MSHREntry mshr[MSHR_SIZE];
 
     vaddr_t  fetch_pc;      /* PC of the next instruction to fetch            */
+
+    /* Per-core store buffer (TSO) */
+    StoreBufEntry sbuf[STORE_BUF_SIZE];
+    int           sbuf_head;
+    int           sbuf_tail;
+    int           sbuf_count;
 } OOOState;
 
 /* ── Globals ──────────────────────────────────────────────────────────────── */

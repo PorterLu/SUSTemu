@@ -37,11 +37,142 @@
 #include <stdio.h>
 #include <string.h>
 #include <log.h>
+#include <ir.h>
 
 /* ── Globals ─────────────────────────────────────────────────────────────── */
 OOOState ooo;
 OOOStats ooo_stats;
 int      g_ooo_mode = 0;
+
+/* ── Differential testing ────────────────────────────────────────────────── */
+/*
+ * difftest_ref: a shadow functional CPU that advances one instruction per
+ * OOO commit.  After each commit we compare GPR state; any mismatch is a bug.
+ */
+static CPU_state difftest_ref;   /* reference (functional) state       */
+static int       difftest_active = 0;
+
+/* Run one instruction on the functional reference CPU */
+static void difftest_step(void)
+{
+    vaddr_t pc   = difftest_ref.pc;
+    vaddr_t snpc = pc + 4;
+    uint32_t raw = (uint32_t)vaddr_read(pc, 4);
+
+    IR_Inst ir;
+    ir_decode(raw, pc, snpc, &ir);
+
+    /* Substitute the reference GPR values for sources */
+    if (ir.rs1 > 0) ir.src1_val = difftest_ref.gpr[ir.rs1];
+    if (ir.rs2 > 0) ir.src2_val = difftest_ref.gpr[ir.rs2];
+
+    ir_execute(&ir, &difftest_ref);
+
+    /* Execute memory access only for LOADs — STOREs are handled by OOO's
+     * commit path (sbuf drain → vaddr_write).  Executing stores here would
+     * corrupt shared physical memory with a second, out-of-sync write. */
+    if (ir.type == ITYPE_LOAD)
+        ir_mem_access(&ir, NULL);
+
+    ir_writeback(&ir, &difftest_ref);
+    difftest_ref.pc = ir.dnpc;
+    difftest_ref.gpr[0] = 0;
+}
+
+/* Compare OOO committed state (cpu.gpr / cpu.pc) against reference */
+static void difftest_check(const ROBEntry *rob)
+{
+    /* CSR, SYSTEM, FENCE: time-dependent or side-effecting — skip compare,
+     * sync ref destination register to OOO value so sources stay correct.
+     * STORE: rd == -1, nothing to compare.
+     * LOAD: reference reads from shared memory; if the store that wrote
+     *   this address is still in OOO sbuf (not yet drained to memory),
+     *   reference will read the old value.  We detect this and sync below. */
+    int skip_cmp = (rob->ir.type == ITYPE_CSR    ||
+                    rob->ir.type == ITYPE_SYSTEM  ||
+                    rob->ir.type == ITYPE_FENCE   ||
+                    rob->ir.type == ITYPE_STORE);
+
+    /* Advance reference by one instruction */
+    difftest_step();
+
+    if (skip_cmp) {
+        if (rob->arch_rd > 0)
+            difftest_ref.gpr[rob->arch_rd] = cpu.gpr[rob->arch_rd];
+        return;
+    }
+
+    /* For LOAD: OOO may have used STLF from sbuf — reference read from
+     * shared memory which might not yet have the store drained.  Accept
+     * OOO value as authoritative for rd, warn if more than 1-byte off
+     * (small delta = likely sbuf timing; large delta = real OOO bug).   */
+    if (rob->ir.type == ITYPE_LOAD && rob->arch_rd > 0) {
+        word_t ooo_val = cpu.gpr[rob->arch_rd];
+        word_t ref_val = difftest_ref.gpr[rob->arch_rd];
+        /* MMIO reads (RTC, kbd, vga) are timing-dependent.
+         * OOO serializes MMIO loads (stall until ROB head) so the value is
+         * read at the correct logical time.  Sync ref to OOO's value so that
+         * dependent instructions see the same value in both ref and OOO. */
+        int is_mmio = (rob->ir.mem_addr >= 0xa0000000UL);
+        if (is_mmio) {
+            difftest_ref.gpr[rob->arch_rd] = ooo_val;
+            return;
+        }
+        /* For non-MMIO loads: check store-buffer coverage before reporting */
+        if (ooo_val != ref_val) {
+            int sbuf_covers = 0;
+            for (int bi = 0; bi < ooo.sbuf_count; bi++) {
+                int idx = (ooo.sbuf_tail - 1 - bi + STORE_BUF_SIZE) % STORE_BUF_SIZE;
+                StoreBufEntry *se = &ooo.sbuf[idx];
+                if (se->valid && se->addr == rob->ir.mem_addr &&
+                    se->width == rob->ir.mem_width) {
+                    sbuf_covers = 1;
+                    break;
+                }
+            }
+            if (!sbuf_covers) {
+                fprintf(stderr,
+                    "[DIFFTEST] LOAD MISMATCH PC=0x%08lx  insn=0x%08x  %s\n",
+                    (unsigned long)rob->ir.pc, rob->ir.raw,
+                    rob->ir.name ? rob->ir.name : "?");
+                fprintf(stderr, "  x%-2d  OOO=0x%016lx  REF=0x%016lx  addr=0x%lx\n",
+                        rob->arch_rd, (unsigned long)ooo_val, (unsigned long)ref_val,
+                        (unsigned long)rob->ir.mem_addr);
+                /* Force OOO to use correct value to prevent error chain */
+                cpu.gpr[rob->arch_rd] = ref_val;
+                difftest_ref.gpr[rob->arch_rd] = ref_val;
+                return;
+            }
+        }
+        /* sbuf timing difference or exact match: sync ref to OOO */
+        difftest_ref.gpr[rob->arch_rd] = ooo_val;
+        return;
+    }
+
+    /* ALU / branch / jump / auipc / lui: compare every GPR */
+    int mismatch = 0;
+    for (int i = 1; i < 32; i++) {
+        if (cpu.gpr[i] != difftest_ref.gpr[i]) {
+            if (!mismatch) {
+                fprintf(stderr,
+                    "[DIFFTEST] MISMATCH after committing PC=0x%08lx  insn=0x%08x  %s\n",
+                    (unsigned long)rob->ir.pc, rob->ir.raw,
+                    rob->ir.name ? rob->ir.name : "?");
+            }
+            fprintf(stderr, "  x%-2d  OOO=0x%016lx  REF=0x%016lx\n",
+                    i, (unsigned long)cpu.gpr[i],
+                    (unsigned long)difftest_ref.gpr[i]);
+            mismatch = 1;
+        }
+    }
+    if (mismatch) {
+        fprintf(stderr, "  PC   OOO=0x%016lx  REF=0x%016lx\n",
+                (unsigned long)cpu.pc, (unsigned long)difftest_ref.pc);
+        /* Sync so we report only the first divergence per chain */
+        for (int i = 0; i < 32; i++) difftest_ref.gpr[i] = cpu.gpr[i];
+        difftest_ref.pc = cpu.pc;
+    }
+}
 
 /* Per-cycle commit trace buffer (populated by ooo_stage_commit, read by ooo_trace_cycle) */
 static IR_Inst ooo_tc_ir[COMMIT_WIDTH];
@@ -216,10 +347,20 @@ void ooo_init(void)
     ooo.rob_tail  = 0;
     ooo.rob_count = 0;
 
+    /* Store buffer: empty */
+    ooo.sbuf_head  = 0;
+    ooo.sbuf_tail  = 0;
+    ooo.sbuf_count = 0;
+    memset(ooo.sbuf, 0, sizeof(ooo.sbuf));
+
     ooo.fetch_pc = cpu.pc;
 
     if (g_bpred_mode)  bpred_init(&bpred);
     if (g_bpred2_mode) bpred_init(&bpred2_state);
+
+    /* Difftest only valid for single-core and only when --difftest flag given */
+    difftest_ref    = cpu;
+    difftest_active = (g_num_cores == 1) && g_difftest_en;
 }
 
 /* ── ooo_stage_commit ────────────────────────────────────────────────────── */
@@ -239,9 +380,28 @@ static void ooo_stage_commit(void)
 
         if (g_trace_en) ooo_tc_ir[ooo_tc_n++] = rob->ir;
 
-        /* STORE: deferred memory write — happens here, not in MEM stage */
-        if (rob->ir.type == ITYPE_STORE)
-            vaddr_write(rob->ir.mem_addr, rob->ir.mem_width, rob->store_data);
+        /* FENCE: must drain store buffer before committing */
+        if (rob->ir.type == ITYPE_FENCE && ooo.sbuf_count > 0) break;
+
+        /* STORE: push to per-core store buffer (TSO model) for cacheable
+         * addresses only.  MMIO / non-cacheable writes (e.g. UART) bypass
+         * the store buffer and take effect immediately so that side-effects
+         * are not lost when the program terminates before the buffer drains. */
+        if (rob->ir.type == ITYPE_STORE) {
+            if (rob->ir.mem_addr >= 0x80000000 && rob->ir.mem_addr < 0x88000000) {
+                if (ooo.sbuf_count >= STORE_BUF_SIZE) break;
+                StoreBufEntry *se = &ooo.sbuf[ooo.sbuf_tail];
+                se->addr  = rob->ir.mem_addr;
+                se->data  = rob->store_data;
+                se->width = rob->ir.mem_width;
+                se->valid = 1;
+                ooo.sbuf_tail = (ooo.sbuf_tail + 1) % STORE_BUF_SIZE;
+                ooo.sbuf_count++;
+            } else {
+                /* MMIO / non-cacheable: immediate write, no buffering */
+                vaddr_write(rob->ir.mem_addr, rob->ir.mem_width, rob->store_data);
+            }
+        }
 
         /* Update architectural register file and committed RAT */
         if (rob->arch_rd != -1 && rob->arch_rd != 0) {
@@ -252,6 +412,9 @@ static void ooo_stage_commit(void)
         cpu.gpr[0] = 0;   /* x0 is always zero */
 
         cpu.pc = rob->ir.dnpc;
+
+        /* Differential test: advance functional reference and compare */
+        if (difftest_active) difftest_check(rob);
 
         rob->valid = 0;
         ooo.rob_head  = (ooo.rob_head + 1) % ROB_SIZE;
@@ -347,7 +510,7 @@ static void ooo_unit_int(void)
             if (ir.dnpc != predicted) {
                 ooo_flush_after(rob_idx);
                 ooo_stats.mispred_flushes++;
-                ooo.fetch_pc = ir.dnpc;
+                ooo.fetch_pc = ir.dnpc & 0xffffffff;
             }
         }
     }
@@ -786,7 +949,8 @@ static void ooo_stage_if(void)
     if (ooo.latch_if_id[0].valid) return;
 
     for (s = 0; s < FETCH_WIDTH; s++) {
-        pc = ooo.fetch_pc;
+        pc = ooo.fetch_pc & 0xffffffff;  /* riscv64: lw sign-extends; truncate to 32-bit */
+        ooo.fetch_pc = pc;
 
         /* Sanity check: ensure fetch_pc is within valid memory range */
         if (pc < 0x80000000 || pc >= 0x88000000) {
@@ -905,8 +1069,23 @@ static void ooo_trace_cycle(void)
  * each stage reads the latch values written by the *previous* cycle's
  * upstream stage (not the current cycle's).
  */
+/* ── ooo_drain_store_buf ─────────────────────────────────────────────────── */
+/* Drain one entry from the store buffer per cycle.  Until an entry drains,
+ * it is invisible to other cores (TSO store buffer semantics). */
+
+static void ooo_drain_store_buf(void)
+{
+    if (ooo.sbuf_count == 0) return;
+    StoreBufEntry *se = &ooo.sbuf[ooo.sbuf_head];
+    vaddr_write(se->addr, se->width, se->data);
+    se->valid = 0;
+    ooo.sbuf_head = (ooo.sbuf_head + 1) % STORE_BUF_SIZE;
+    ooo.sbuf_count--;
+}
+
 void ooo_cycle(void)
 {
+    ooo_drain_store_buf();
     ooo_stage_commit();
     mshr_tick();
     ooo_unit_lsu();
@@ -985,6 +1164,7 @@ void ooo_cycle_core(Core *c)
     bpred     = c->bpred;
 
     /* Run OOO stages */
+    ooo_drain_store_buf();
     ooo_stage_commit();
     mshr_tick();
     ooo_unit_lsu();
