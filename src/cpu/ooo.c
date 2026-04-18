@@ -38,11 +38,14 @@
 #include <string.h>
 #include <log.h>
 #include <ir.h>
+#include <ringbuf.h>
+#include <disasm.hpp>
 
 /* ── Globals ─────────────────────────────────────────────────────────────── */
 OOOState ooo;
 OOOStats ooo_stats;
 int      g_ooo_mode = 0;
+
 
 /* ── Differential testing ────────────────────────────────────────────────── */
 /*
@@ -264,7 +267,9 @@ static void ooo_flush_after(int branch_rob_idx)
             if (entry->arch_rd != -1 && entry->arch_rd != 0) {
                 /* Restore speculative RAT entry */
                 ooo.rat[entry->arch_rd] = entry->old_phys;
-                /* Return the prematurely-allocated physical register */
+                /* Return the prematurely-allocated physical register.
+                 * Clear ready so the next owner doesn't see a stale value. */
+                ooo.prf[entry->phys_rd].ready = 0;
                 freelist_push(entry->phys_rd);
             }
             entry->valid = 0;
@@ -380,8 +385,27 @@ static void ooo_stage_commit(void)
 
         if (g_trace_en) ooo_tc_ir[ooo_tc_n++] = rob->ir;
 
+        /* trace committed instructions into ring buffer and log file (same format as exec_once) */
+        {
+            static char commit_buf[128];
+            uint32_t raw = rob->ir.raw;
+            sprintf(commit_buf, "%016lx:    ", (unsigned long)rob->ir.pc);
+            for (int bi = 0; bi < 4; bi++)
+                sprintf(commit_buf + 21 + 3 * bi, "%02x ", *(((uint8_t *)&raw) + 3 - bi));
+            sprintf(commit_buf + 33, "   ");
+            disassemble(commit_buf + 36, 70, rob->ir.pc, (uint8_t *)&raw, 4);
+            add_ringbuf_inst(commit_buf);
+            log_write("%s\n", commit_buf);
+        }
+
         /* FENCE: must drain store buffer before committing */
         if (rob->ir.type == ITYPE_FENCE && ooo.sbuf_count > 0) break;
+
+        /* Faulted instruction reached commit — this must never happen on the
+         * correct path (it should have been squashed by an earlier flush). */
+        if (rob->ir.fault)
+            panic("faulted instruction reached commit: PC=0x%lx mem_addr=0x%lx\n",
+                  (unsigned long)rob->ir.pc, (unsigned long)rob->ir.mem_addr);
 
         /* STORE: push to per-core store buffer (TSO model) for cacheable
          * addresses only.  MMIO / non-cacheable writes (e.g. UART) bypass
@@ -407,6 +431,7 @@ static void ooo_stage_commit(void)
         if (rob->arch_rd != -1 && rob->arch_rd != 0) {
             cpu.gpr[rob->arch_rd]   = ooo.prf[rob->phys_rd].value;
             ooo.rrat[rob->arch_rd]  = rob->phys_rd;
+            ooo.prf[rob->old_phys].ready = 0;  /* prevent stale CDB wakeup on reuse */
             freelist_push(rob->old_phys);   /* Return the superseded physical reg */
         }
         cpu.gpr[0] = 0;   /* x0 is always zero */
@@ -623,12 +648,22 @@ static void ooo_unit_lsu(void)
                 continue;
             }
 
+            /* LOAD: MMIO must execute in-order — stall until ROB head */
+            if (ir->mem_addr >= 0xa0000000UL) {
+                if (rob_idx != ooo.rob_head) {
+                    ooo.latch_lsu[s].cycles_rem = -2; /* waiting for ROB head */
+                    continue;
+                }
+                goto lsu_do_fill;
+            }
+
             /* LOAD: probe cache level */
             int level = vaddr_probe_level(ir->mem_addr);
             int lat   = level_to_lat[level];
 
             if (lat == 1) {
-                /* L1 hit: fill and read immediately */
+                /* L1 hit: fill immediately (INT unit runs before LSU, so any
+                 * same-cycle branch misprediction flush has already happened) */
                 goto lsu_do_fill;
             }
 
@@ -641,6 +676,17 @@ static void ooo_unit_lsu(void)
             continue;
         }
 
+        /* ── L1 hit: fill on second visit ────────────────────────────────── */
+        if (mi == -1 && ooo.latch_lsu[s].cycles_rem == 0) {
+            goto lsu_do_fill;
+        }
+
+        /* ── MMIO waiting for ROB head ───────────────────────────────────── */
+        if (mi == -1 && ooo.latch_lsu[s].cycles_rem == -2) {
+            if (rob_idx != ooo.rob_head) continue;
+            goto lsu_do_fill;
+        }
+
         /* ── Waiting on MSHR ─────────────────────────────────────────────── */
         if (mi >= 0) {
             if (ooo.mshr[mi].cycles_rem > 0) continue;
@@ -649,6 +695,28 @@ static void ooo_unit_lsu(void)
 
 lsu_do_fill:
         {
+            paddr_t pa = ir->mem_addr & 0xffffffff;
+            bool is_dram = (pa >= 0x80000000UL && pa < 0x88000000UL);
+            bool is_mmio = (pa >= 0xa0000000UL);
+            if (!is_dram && !is_mmio) {
+                /* Wrong-path speculative LOAD to an invalid address.
+                 * The older branch/JAL that redirected control hasn't executed
+                 * yet (INT slots busy), so LSU ran first.  Mark as faulted so
+                 * the flush triggered by that branch will silently discard this
+                 * ROB entry.  If this somehow reaches commit it is a real bug. */
+                ir->fault = 1;
+                ir->result = 0;
+                int phys_rd = ooo.latch_lsu[s].phys_rd;
+                if (phys_rd > 0) {
+                    ooo.prf[phys_rd].value = 0;
+                    ooo.prf[phys_rd].ready = 1;
+                    cdb_broadcast(phys_rd);
+                }
+                ooo.rob[rob_idx].ir    = *ir;
+                ooo.rob[rob_idx].ready = 1;
+                ooo.latch_lsu[s].valid = 0;
+                continue;
+            }
             word_t raw = vaddr_fill_and_read(ir->mem_addr, ir->mem_width);
             if (ir->mem_sign) {
                 switch (ir->mem_width) {
@@ -666,8 +734,21 @@ lsu_do_fill:
                 }
             }
 
-            /* STLF: check ROB for most-recent ready STORE to same address */
+            /* STLF: check sbuf (committed stores not yet drained) first,
+             * then ROB (in-flight stores). ROB wins if it has a matching
+             * entry (it is newer than anything in sbuf). */
             {
+                /* sbuf scan: find most-recently-enqueued entry at same addr */
+                for (int bi = 0; bi < ooo.sbuf_count; bi++) {
+                    int idx = (ooo.sbuf_head + bi) % STORE_BUF_SIZE;
+                    StoreBufEntry *se = &ooo.sbuf[idx];
+                    if (se->valid && se->addr == ir->mem_addr &&
+                        se->width == ir->mem_width)
+                        ir->result = se->data;
+                }
+            }
+            {
+                /* ROB scan: find most-recent ready STORE to same address */
                 int scan = ooo.rob_head, match_idx = -1;
                 while (scan != rob_idx) {
                     ROBEntry *roe = &ooo.rob[scan];
@@ -883,7 +964,6 @@ static void ooo_stage_rn(void)
                 rs->src1_val   = 0;
             }
         }
-
         /* ── Source 2 operand (using pre-rename mapping) ────────────────────── */
         if (ir->rs2 == -1) {
             rs->src2_ready = 1;
@@ -1088,9 +1168,9 @@ void ooo_cycle(void)
     ooo_drain_store_buf();
     ooo_stage_commit();
     mshr_tick();
-    ooo_unit_lsu();
+    ooo_unit_int();   /* run before LSU so mispred flushes happen first */
     ooo_unit_mul();
-    ooo_unit_int();
+    ooo_unit_lsu();
     ooo_stage_is();
     ooo_stage_rn();
     ooo_stage_id();
@@ -1167,9 +1247,9 @@ void ooo_cycle_core(Core *c)
     ooo_drain_store_buf();
     ooo_stage_commit();
     mshr_tick();
-    ooo_unit_lsu();
+    ooo_unit_int();   /* run before LSU so mispred flushes happen first */
     ooo_unit_mul();
-    ooo_unit_int();
+    ooo_unit_lsu();
     ooo_stage_is();
     ooo_stage_rn();
     ooo_stage_id();

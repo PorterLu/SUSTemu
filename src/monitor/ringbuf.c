@@ -14,10 +14,10 @@ static ringbuf rb;
 void print_ringbuf(){
 	for(int i = 0; i < RINGBUFSIZE; i++){
 		if(i == rb.pointer)
-			printf("---> ");
+			fprintf(stderr, "---> ");
 		else
-			printf("     ");
-		puts(rb.buf[i]);
+			fprintf(stderr, "     ");
+		fprintf(stderr, "%s\n", rb.buf[i]);
 	}
 }
 
