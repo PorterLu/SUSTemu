@@ -116,11 +116,17 @@ $(LITENES_ELF): $(LITENES_BIN)
 $(LITENES_BIN):
 	AM_HOME=$(AM_HOME) make -C $(LITENES_DIR) ARCH=riscv64-nemu
 
+ifeq ($(UNAME_S),Linux)
+  TASKSET = taskset -c 0
+else
+  TASKSET =
+endif
+
 run-mario: all $(LITENES_BIN)
-	DISPLAY=:0 taskset -c 0 ./build/sustemu --ooo --bpred -b -e $(LITENES_ELF) $(LITENES_BIN)
+	DISPLAY=:0 $(TASKSET) ./build/sustemu --ooo --bpred -b -e $(LITENES_ELF) $(LITENES_BIN)
 
 run-mario-inorder: all $(LITENES_BIN)
-	DISPLAY=:0 taskset -c 0 ./build/sustemu --inorder --bpred -b -e $(LITENES_ELF) $(LITENES_BIN)
+	DISPLAY=:0 $(TASKSET) ./build/sustemu --inorder --bpred -b -e $(LITENES_ELF) $(LITENES_BIN)
 
 run-mario-difftest: all $(LITENES_BIN)
 	DISPLAY=:0 ./build/sustemu --ooo --bpred --difftest -b -e $(LITENES_ELF) $(LITENES_BIN)
