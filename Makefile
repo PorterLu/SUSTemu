@@ -27,7 +27,7 @@ ifeq ($(UNAME_S),Darwin)
   BREW_RL   = /opt/homebrew/opt/readline
 
   LIBS = -lSDL2 -lreadline
-  CFLAGS = -O2 -Wall -Werror -Wno-format -MMD $(INC_PATH)
+  CFLAGS = -O3 -march=native -Wall -Wno-format -MMD $(INC_PATH)
   CFLAGS += -I$(BREW_SDL2)/include -I$(BREW_RL)/include
   CXXFLAGS = $(shell $(LLVM_CONFIG) --cxxflags)
   CXXFLAGS += -fno-exceptions -fPIE
