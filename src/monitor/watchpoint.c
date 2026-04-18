@@ -6,6 +6,7 @@
 
 static WP wp_pool[NR_WP];
 static WP *head, *free_;
+WP *g_wp_head = NULL;  /* public alias of head — checked inline by wp_any_active() */
 
 void init_wp_pool(){
 	int i;
@@ -17,6 +18,7 @@ void init_wp_pool(){
 	wp_pool[NR_WP - 1].next = NULL;
 
 	head = NULL;
+	g_wp_head = NULL;
 	free_ = wp_pool;
 }
 
@@ -29,6 +31,7 @@ void new_wp(char *expression)
 		free_ = pointer->next;
 		pointer->next = head;
 		head = pointer;
+		g_wp_head = head;
 		strcpy(pointer->expr, expression);
 		pointer->value = expr(expression, &success);
 	}
@@ -49,6 +52,7 @@ void free_wp(int NO)
 
 			pointer->next = free_;
 			free_ = pointer;
+			g_wp_head = head;
 			return;
 		}
 		pre = pointer;

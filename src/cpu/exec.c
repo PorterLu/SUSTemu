@@ -149,7 +149,7 @@ void exec(uint64_t n)
 			for (int i = 0; i < g_num_cores; i++) {
 				core_cycle(&cores[i]);
 				total++;
-				if (check_wp() && state != NEMU_ABORT)
+				if (wp_any_active() && check_wp() && state != NEMU_ABORT)
 					state = NEMU_STOP;
 				if (state != NEMU_RUNNING) break;
 			}
@@ -161,7 +161,7 @@ void exec(uint64_t n)
 		ooo_init();
 		while (ooo_stats.insts < n && state == NEMU_RUNNING) {
 			ooo_cycle();
-			if (check_wp() && state != NEMU_ABORT)
+			if (wp_any_active() && check_wp() && state != NEMU_ABORT)
 				state = NEMU_STOP;
 #ifdef CONFIG_timer
 			static uint64_t ooo_last = 0;
@@ -198,7 +198,7 @@ void exec(uint64_t n)
 		pipeline_init();
 		while (pipe_stats.insts < n && state == NEMU_RUNNING) {
 			pipeline_cycle();
-			if (check_wp() && state != NEMU_ABORT)
+			if (wp_any_active() && check_wp() && state != NEMU_ABORT)
 				state = NEMU_STOP;
 #ifdef CONFIG_timer
 			static uint64_t pip_last = 0;
@@ -234,7 +234,7 @@ void exec(uint64_t n)
 		/* ── Functional simulation mode (default) ────────── */
 		for (; n > 0; n--) {
 			exec_once();
-			if (check_wp() && state != NEMU_ABORT)
+			if (wp_any_active() && check_wp() && state != NEMU_ABORT)
 				state = NEMU_STOP;
 			if (state != NEMU_RUNNING)
 				break;

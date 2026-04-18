@@ -38,6 +38,7 @@
 #include <inttypes.h>
 #include <csr.h>
 #include <exec_cfg.h>
+#include <stdlib.h>
 
 /* ── Global pipeline state ──────────────────────────────────────────────── */
 Pipeline  cpu_pipe;
