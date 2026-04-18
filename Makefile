@@ -11,7 +11,7 @@ SRCS = $(ASRCS) $(CSRCS) $(CXXSRCS)
 
 OBJS = $(CSRCS:%.c=$(OBJ_DIR)/%.o) $(CXXSRCS:%.cc=$(OBJ_DIR)/%.o) $(ASRCS:%.S=$(OBJ_DIR)/%.o)
 
-INC_PATH := $(abspath $(shell find ./include -maxdepth 1))
+INC_PATH := $(abspath $(shell find ./include -maxdepth 1 -type d))
 INC_PATH := $(filter-out  $(abspath ./include/config), $(INC_PATH))
 INC_PATH += $(abspath ./include/generated)
 
