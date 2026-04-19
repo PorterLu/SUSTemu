@@ -26,7 +26,8 @@
 #include <core.h>
 
 char* elf_file = NULL;
-int   g_trace_en = 0;   /* --trace: per-cycle pipeline trace to log file */
+int   g_trace_en    = 0;   /* --trace: per-cycle pipeline trace to log file */
+int   g_difftest_en = 0;   /* --difftest: enable OOO vs functional diff-test  */
 
 extern int g_inorder_mode;  /* defined in exec.c */
 extern int g_bpred_mode;    /* defined in exec.c */
@@ -54,12 +55,13 @@ int parse_args(int argc, char *argv[])
 		{"bpred2",	no_argument			, &g_bpred2_mode, 1},
 		{"ooo",		no_argument			, NULL, 'o'},
 		{"dual",	no_argument			, NULL, 'd'},
+		{"difftest",no_argument			, NULL, 'D'},
 		{"trace",	no_argument			, &g_trace_en, 1},
 		{0		, 	0					, NULL,  0 }
 	};
 
 	int o;
-	while((o=getopt_long(argc, argv, "-bs:e:l:t:ipod", table, NULL))!=-1)
+	while((o=getopt_long(argc, argv, "-bs:e:l:t:ipodD", table, NULL))!=-1)
 	{
 		switch(o)
 		{
@@ -71,6 +73,7 @@ int parse_args(int argc, char *argv[])
 			case 'p': g_bpred_mode = 1; break;
 			case 'o': g_ooo_mode = 1;   g_default_mode = CORE_MODE_OOO; break;
 			case 'd': g_dual_flag = 1; break;
+			case 'D': g_difftest_en = 1; break;
 			case 1: img_file = optarg;return 0;
 		}
 	}

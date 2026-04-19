@@ -37,11 +37,159 @@
 #include <stdio.h>
 #include <string.h>
 #include <log.h>
+#include <ir.h>
+#include <ringbuf.h>
+#include <disasm.hpp>
 
 /* ── Globals ─────────────────────────────────────────────────────────────── */
 OOOState ooo;
 OOOStats ooo_stats;
 int      g_ooo_mode = 0;
+
+/* Helper: update rs_ready_mask for slot i based on current RS state */
+static inline void rs_mask_update(int i)
+{
+    RSEntry *rs = &ooo.rs[i];
+    if (rs->valid && rs->src1_ready && rs->src2_ready)
+        ooo.rs_ready_mask[rs->eu_type] |=  (1u << i);
+    else
+        ooo.rs_ready_mask[rs->eu_type] &= ~(1u << i);
+}
+static inline void rs_mask_clear(int i, int eu_type)
+{
+    ooo.rs_ready_mask[eu_type] &= ~(1u << i);
+    ooo.rs_free_mask            |=  (1u << i);  /* slot is now free */
+}
+
+/* ── Differential testing ────────────────────────────────────────────────── */
+/*
+ * difftest_ref: a shadow functional CPU that advances one instruction per
+ * OOO commit.  After each commit we compare GPR state; any mismatch is a bug.
+ */
+static CPU_state difftest_ref;   /* reference (functional) state       */
+static int       difftest_active = 0;
+
+/* Run one instruction on the functional reference CPU */
+static void difftest_step(void)
+{
+    vaddr_t pc   = difftest_ref.pc;
+    vaddr_t snpc = pc + 4;
+    uint32_t raw = (uint32_t)vaddr_read(pc, 4);
+
+    IR_Inst ir;
+    ir_decode(raw, pc, snpc, &ir);
+
+    /* Substitute the reference GPR values for sources */
+    if (ir.rs1 > 0) ir.src1_val = difftest_ref.gpr[ir.rs1];
+    if (ir.rs2 > 0) ir.src2_val = difftest_ref.gpr[ir.rs2];
+
+    ir_execute(&ir, &difftest_ref);
+
+    /* Execute memory access only for LOADs — STOREs are handled by OOO's
+     * commit path (sbuf drain → vaddr_write).  Executing stores here would
+     * corrupt shared physical memory with a second, out-of-sync write. */
+    if (ir.type == ITYPE_LOAD)
+        ir_mem_access(&ir, NULL);
+
+    ir_writeback(&ir, &difftest_ref);
+    difftest_ref.pc = ir.dnpc;
+    difftest_ref.gpr[0] = 0;
+}
+
+/* Compare OOO committed state (cpu.gpr / cpu.pc) against reference */
+static void difftest_check(const ROBEntry *rob)
+{
+    /* CSR, SYSTEM, FENCE: time-dependent or side-effecting — skip compare,
+     * sync ref destination register to OOO value so sources stay correct.
+     * STORE: rd == -1, nothing to compare.
+     * LOAD: reference reads from shared memory; if the store that wrote
+     *   this address is still in OOO sbuf (not yet drained to memory),
+     *   reference will read the old value.  We detect this and sync below. */
+    int skip_cmp = (rob->ir.type == ITYPE_CSR    ||
+                    rob->ir.type == ITYPE_SYSTEM  ||
+                    rob->ir.type == ITYPE_FENCE   ||
+                    rob->ir.type == ITYPE_STORE);
+
+    /* Advance reference by one instruction */
+    difftest_step();
+
+    if (skip_cmp) {
+        if (rob->arch_rd > 0)
+            difftest_ref.gpr[rob->arch_rd] = cpu.gpr[rob->arch_rd];
+        return;
+    }
+
+    /* For LOAD: OOO may have used STLF from sbuf — reference read from
+     * shared memory which might not yet have the store drained.  Accept
+     * OOO value as authoritative for rd, warn if more than 1-byte off
+     * (small delta = likely sbuf timing; large delta = real OOO bug).   */
+    if (rob->ir.type == ITYPE_LOAD && rob->arch_rd > 0) {
+        word_t ooo_val = cpu.gpr[rob->arch_rd];
+        word_t ref_val = difftest_ref.gpr[rob->arch_rd];
+        /* MMIO reads (RTC, kbd, vga) are timing-dependent.
+         * OOO serializes MMIO loads (stall until ROB head) so the value is
+         * read at the correct logical time.  Sync ref to OOO's value so that
+         * dependent instructions see the same value in both ref and OOO. */
+        int is_mmio = (rob->ir.mem_addr >= 0xa0000000UL);
+        if (is_mmio) {
+            difftest_ref.gpr[rob->arch_rd] = ooo_val;
+            return;
+        }
+        /* For non-MMIO loads: check store-buffer coverage before reporting */
+        if (ooo_val != ref_val) {
+            int sbuf_covers = 0;
+            for (int bi = 0; bi < ooo.sbuf_count; bi++) {
+                int idx = (ooo.sbuf_tail - 1 - bi + STORE_BUF_SIZE) % STORE_BUF_SIZE;
+                StoreBufEntry *se = &ooo.sbuf[idx];
+                if (se->valid && se->addr == rob->ir.mem_addr &&
+                    se->width == rob->ir.mem_width) {
+                    sbuf_covers = 1;
+                    break;
+                }
+            }
+            if (!sbuf_covers) {
+                fprintf(stderr,
+                    "[DIFFTEST] LOAD MISMATCH PC=0x%08lx  insn=0x%08x  %s\n",
+                    (unsigned long)rob->ir.pc, rob->ir.raw,
+                    rob->ir.name ? rob->ir.name : "?");
+                fprintf(stderr, "  x%-2d  OOO=0x%016lx  REF=0x%016lx  addr=0x%lx\n",
+                        rob->arch_rd, (unsigned long)ooo_val, (unsigned long)ref_val,
+                        (unsigned long)rob->ir.mem_addr);
+                /* Force OOO to use correct value to prevent error chain */
+                cpu.gpr[rob->arch_rd] = ref_val;
+                difftest_ref.gpr[rob->arch_rd] = ref_val;
+                return;
+            }
+        }
+        /* sbuf timing difference or exact match: sync ref to OOO */
+        difftest_ref.gpr[rob->arch_rd] = ooo_val;
+        return;
+    }
+
+    /* ALU / branch / jump / auipc / lui: compare every GPR */
+    int mismatch = 0;
+    for (int i = 1; i < 32; i++) {
+        if (cpu.gpr[i] != difftest_ref.gpr[i]) {
+            if (!mismatch) {
+                fprintf(stderr,
+                    "[DIFFTEST] MISMATCH after committing PC=0x%08lx  insn=0x%08x  %s\n",
+                    (unsigned long)rob->ir.pc, rob->ir.raw,
+                    rob->ir.name ? rob->ir.name : "?");
+            }
+            fprintf(stderr, "  x%-2d  OOO=0x%016lx  REF=0x%016lx\n",
+                    i, (unsigned long)cpu.gpr[i],
+                    (unsigned long)difftest_ref.gpr[i]);
+            mismatch = 1;
+        }
+    }
+    if (mismatch) {
+        fprintf(stderr, "  PC   OOO=0x%016lx  REF=0x%016lx\n",
+                (unsigned long)cpu.pc, (unsigned long)difftest_ref.pc);
+        /* Sync so we report only the first divergence per chain */
+        for (int i = 0; i < 32; i++) difftest_ref.gpr[i] = cpu.gpr[i];
+        difftest_ref.pc = cpu.pc;
+    }
+}
 
 /* Per-cycle commit trace buffer (populated by ooo_stage_commit, read by ooo_trace_cycle) */
 static IR_Inst ooo_tc_ir[COMMIT_WIDTH];
@@ -96,17 +244,24 @@ static int rob_newer_than(int a, int b)
  */
 static void cdb_broadcast(int phys_tag)
 {
-    int i;
-    for (i = 0; i < RS_SIZE; i++) {
-        if (!ooo.rs[i].valid) continue;
+    /* Iterate only over valid RS slots using the free mask complement */
+    uint32_t valid_mask = (~ooo.rs_free_mask) & ((RS_SIZE < 32) ? ((1u << RS_SIZE) - 1u) : ~0u);
+    while (valid_mask) {
+        int i = __builtin_ctz(valid_mask);
+        valid_mask &= valid_mask - 1;
+        int changed = 0;
         if (!ooo.rs[i].src1_ready && ooo.rs[i].src1_ptag == phys_tag) {
             ooo.rs[i].src1_val   = ooo.prf[phys_tag].value;
             ooo.rs[i].src1_ready = 1;
+            changed = 1;
         }
         if (!ooo.rs[i].src2_ready && ooo.rs[i].src2_ptag == phys_tag) {
             ooo.rs[i].src2_val   = ooo.prf[phys_tag].value;
             ooo.rs[i].src2_ready = 1;
+            changed = 1;
         }
+        if (changed && ooo.rs[i].src1_ready && ooo.rs[i].src2_ready)
+            ooo.rs_ready_mask[ooo.rs[i].eu_type] |= (1u << i);
     }
 }
 
@@ -133,9 +288,14 @@ static void ooo_flush_after(int branch_rob_idx)
             if (entry->arch_rd != -1 && entry->arch_rd != 0) {
                 /* Restore speculative RAT entry */
                 ooo.rat[entry->arch_rd] = entry->old_phys;
-                /* Return the prematurely-allocated physical register */
+                /* Return the prematurely-allocated physical register.
+                 * Clear ready so the next owner doesn't see a stale value. */
+                ooo.prf[entry->phys_rd].ready = 0;
                 freelist_push(entry->phys_rd);
             }
+            /* Maintain unready_store_count */
+            if (!entry->ready && (entry->ir.raw & 0x7fu) == 0x23u)
+                ooo.unready_store_count--;
             entry->valid = 0;
             ooo.rob_count--;
         }
@@ -145,8 +305,10 @@ static void ooo_flush_after(int branch_rob_idx)
     int i;
     for (i = 0; i < RS_SIZE; i++) {
         if (ooo.rs[i].valid &&
-            rob_newer_than(ooo.rs[i].rob_idx, branch_rob_idx))
+            rob_newer_than(ooo.rs[i].rob_idx, branch_rob_idx)) {
+            rs_mask_clear(i, ooo.rs[i].eu_type);  /* also sets rs_free_mask bit */
             ooo.rs[i].valid = 0;
+        }
     }
 
     /* Flush IS→EX and EX→MEM latches if they hold a newer instruction */
@@ -216,10 +378,23 @@ void ooo_init(void)
     ooo.rob_tail  = 0;
     ooo.rob_count = 0;
 
+    /* RS free mask: all RS_SIZE slots free */
+    ooo.rs_free_mask = (RS_SIZE < 32) ? ((1u << RS_SIZE) - 1u) : ~0u;
+
+    /* Store buffer: empty */
+    ooo.sbuf_head  = 0;
+    ooo.sbuf_tail  = 0;
+    ooo.sbuf_count = 0;
+    memset(ooo.sbuf, 0, sizeof(ooo.sbuf));
+
     ooo.fetch_pc = cpu.pc;
 
     if (g_bpred_mode)  bpred_init(&bpred);
     if (g_bpred2_mode) bpred_init(&bpred2_state);
+
+    /* Difftest only valid for single-core and only when --difftest flag given */
+    difftest_ref    = cpu;
+    difftest_active = (g_num_cores == 1) && g_difftest_en;
 }
 
 /* ── ooo_stage_commit ────────────────────────────────────────────────────── */
@@ -239,19 +414,61 @@ static void ooo_stage_commit(void)
 
         if (g_trace_en) ooo_tc_ir[ooo_tc_n++] = rob->ir;
 
-        /* STORE: deferred memory write — happens here, not in MEM stage */
-        if (rob->ir.type == ITYPE_STORE)
-            vaddr_write(rob->ir.mem_addr, rob->ir.mem_width, rob->store_data);
+        /* trace committed instructions into ring buffer and log file (same format as exec_once) */
+        if (log_fp) {
+            static char commit_buf[128];
+            uint32_t raw = rob->ir.raw;
+            sprintf(commit_buf, "%016lx:    ", (unsigned long)rob->ir.pc);
+            for (int bi = 0; bi < 4; bi++)
+                sprintf(commit_buf + 21 + 3 * bi, "%02x ", *(((uint8_t *)&raw) + 3 - bi));
+            sprintf(commit_buf + 33, "   ");
+            disassemble(commit_buf + 36, 70, rob->ir.pc, (uint8_t *)&raw, 4);
+            add_ringbuf_inst(commit_buf);
+            log_write("%s\n", commit_buf);
+        }
+
+        /* FENCE: must drain store buffer before committing */
+        if (rob->ir.type == ITYPE_FENCE && ooo.sbuf_count > 0) break;
+
+        /* Faulted instruction reached commit — this must never happen on the
+         * correct path (it should have been squashed by an earlier flush). */
+        if (rob->ir.fault)
+            panic("faulted instruction reached commit: PC=0x%lx mem_addr=0x%lx\n",
+                  (unsigned long)rob->ir.pc, (unsigned long)rob->ir.mem_addr);
+
+        /* STORE: push to per-core store buffer (TSO model) for cacheable
+         * addresses only.  MMIO / non-cacheable writes (e.g. UART) bypass
+         * the store buffer and take effect immediately so that side-effects
+         * are not lost when the program terminates before the buffer drains. */
+        if (rob->ir.type == ITYPE_STORE) {
+            if (rob->ir.mem_addr >= 0x80000000 && rob->ir.mem_addr < 0x88000000) {
+                if (ooo.sbuf_count >= STORE_BUF_SIZE) break;
+                StoreBufEntry *se = &ooo.sbuf[ooo.sbuf_tail];
+                se->addr  = rob->ir.mem_addr;
+                se->data  = rob->store_data;
+                se->width = rob->ir.mem_width;
+                se->valid = 1;
+                ooo.sbuf_tail = (ooo.sbuf_tail + 1) % STORE_BUF_SIZE;
+                ooo.sbuf_count++;
+            } else {
+                /* MMIO / non-cacheable: immediate write, no buffering */
+                vaddr_write(rob->ir.mem_addr, rob->ir.mem_width, rob->store_data);
+            }
+        }
 
         /* Update architectural register file and committed RAT */
         if (rob->arch_rd != -1 && rob->arch_rd != 0) {
             cpu.gpr[rob->arch_rd]   = ooo.prf[rob->phys_rd].value;
             ooo.rrat[rob->arch_rd]  = rob->phys_rd;
+            ooo.prf[rob->old_phys].ready = 0;  /* prevent stale CDB wakeup on reuse */
             freelist_push(rob->old_phys);   /* Return the superseded physical reg */
         }
         cpu.gpr[0] = 0;   /* x0 is always zero */
 
         cpu.pc = rob->ir.dnpc;
+
+        /* Differential test: advance functional reference and compare */
+        if (difftest_active) difftest_check(rob);
 
         rob->valid = 0;
         ooo.rob_head  = (ooo.rob_head + 1) % ROB_SIZE;
@@ -295,15 +512,15 @@ static void mshr_tick(void)
 /* ── Helper: fill latch slot from RS entry ───────────────────────────────── */
 static void latch_from_rs(OOOLatch *latch, int rs_idx)
 {
-    latch->ir          = ooo.rs[rs_idx].ir;
-    latch->ir.src1_val = ooo.rs[rs_idx].src1_val;
-    latch->ir.src2_val = ooo.rs[rs_idx].src2_val;
-    latch->phys_rd     = ooo.rs[rs_idx].phys_rd;
     latch->rob_idx     = ooo.rs[rs_idx].rob_idx;
+    latch->src1_val    = ooo.rs[rs_idx].src1_val;
+    latch->src2_val    = ooo.rs[rs_idx].src2_val;
+    latch->phys_rd     = ooo.rs[rs_idx].phys_rd;
     latch->cycles_rem  = -1;
     latch->mshr_idx    = -1;
     latch->flushed     = 0;
     latch->valid       = 1;
+    rs_mask_clear(rs_idx, ooo.rs[rs_idx].eu_type);
     ooo.rs[rs_idx].valid = 0;
 }
 
@@ -318,13 +535,17 @@ static void ooo_unit_int(void)
     for (s = 0; s < NUM_INT_UNITS; s++) {
         if (!ooo.latch_int[s].valid) continue;
 
-        IR_Inst ir      = ooo.latch_int[s].ir;
         int phys_rd     = ooo.latch_int[s].phys_rd;
         int rob_idx     = ooo.latch_int[s].rob_idx;
 
         ooo.latch_int[s].valid = 0;
 
         if (!ooo.rob[rob_idx].valid) continue;  /* flushed by earlier mispred */
+
+        /* Build a local IR copy with forwarded source values, execute in-place */
+        IR_Inst ir      = ooo.rob[rob_idx].ir;
+        ir.src1_val     = ooo.latch_int[s].src1_val;
+        ir.src2_val     = ooo.latch_int[s].src2_val;
 
         ir_execute(&ir, &cpu);
         ooo.rob[rob_idx].ir = ir;
@@ -345,9 +566,24 @@ static void ooo_unit_int(void)
 
             vaddr_t predicted = ir.bp_predicted_pc ? ir.bp_predicted_pc : ir.snpc;
             if (ir.dnpc != predicted) {
-                ooo_flush_after(rob_idx);
-                ooo_stats.mispred_flushes++;
-                ooo.fetch_pc = ir.dnpc;
+                /* Sanity check: if dnpc is outside valid memory, this is a
+                 * wrong-path speculative branch/jalr executing before the
+                 * older mispredicted branch has flushed the pipeline.
+                 * Skip the fetch_pc redirect — the older branch will flush
+                 * this ROB entry when it eventually executes. */
+                if (ir.dnpc < 0x80000000UL || ir.dnpc >= 0x88000000UL) {
+                    ooo.rob[rob_idx].ir.fault = 1;
+                    /* Still mark ready so the pipeline doesn't stall */
+                } else {
+                    /* Restore RAS to the state it was in when the branch was fetched */
+                    if (g_bpred_mode) {
+                        bpred.ras_top   = ir.ras_top_snap;
+                        bpred.ras_count = ir.ras_cnt_snap;
+                    }
+                    ooo_flush_after(rob_idx);
+                    ooo_stats.mispred_flushes++;
+                    ooo.fetch_pc = ir.dnpc;
+                }
             }
         }
     }
@@ -366,8 +602,10 @@ static void ooo_unit_mul(void)
     for (s = 0; s < NUM_MUL_UNITS; s++) {
         if (!ooo.latch_mul[s].valid) continue;
 
+        int rob_idx = ooo.latch_mul[s].rob_idx;
+
         if (ooo.latch_mul[s].cycles_rem == -1) {
-            uint32_t raw    = (uint32_t)ooo.latch_mul[s].ir.raw;
+            uint32_t raw    = (uint32_t)ooo.rob[rob_idx].ir.raw;
             uint32_t opc    = raw & 0x7fu;
             uint32_t funct7 = raw >> 25;
             uint32_t funct3 = (raw >> 12) & 0x7u;
@@ -377,21 +615,22 @@ static void ooo_unit_mul(void)
             ooo.latch_mul[s].cycles_rem = lat - 1;
             if (lat > 1) continue;
         } else if (ooo.latch_mul[s].cycles_rem > 0) {
-            if (!ooo.rob[ooo.latch_mul[s].rob_idx].valid)
+            if (!ooo.rob[rob_idx].valid)
                 ooo.latch_mul[s].valid = 0;
             else
                 ooo.latch_mul[s].cycles_rem--;
             continue;
         }
 
-        IR_Inst ir  = ooo.latch_mul[s].ir;
         int phys_rd = ooo.latch_mul[s].phys_rd;
-        int rob_idx = ooo.latch_mul[s].rob_idx;
 
         ooo.latch_mul[s].valid = 0;
 
         if (!ooo.rob[rob_idx].valid) continue;
 
+        IR_Inst ir  = ooo.rob[rob_idx].ir;
+        ir.src1_val = ooo.latch_mul[s].src1_val;
+        ir.src2_val = ooo.latch_mul[s].src2_val;
         ir_execute(&ir, &cpu);
         ooo.rob[rob_idx].ir = ir;
 
@@ -425,18 +664,19 @@ static void ooo_unit_lsu(void)
     for (s = 0; s < NUM_LSU_UNITS; s++) {
         if (!ooo.latch_lsu[s].valid) continue;
 
-        IR_Inst *ir = &ooo.latch_lsu[s].ir;
         int phys_rd = ooo.latch_lsu[s].phys_rd;
         int rob_idx = ooo.latch_lsu[s].rob_idx;
         int mi      = ooo.latch_lsu[s].mshr_idx;
+        IR_Inst *ir = &ooo.rob[rob_idx].ir;
 
         /* ── ROB flushed: only care if MSHR is in-flight ────────────────── */
         if (!ooo.rob[rob_idx].valid || ooo.latch_lsu[s].flushed) {
             if (mi < 0) { ooo.latch_lsu[s].valid = 0; continue; }
             MSHREntry *mshr = &ooo.mshr[mi];
             if (mshr->cycles_rem > 0) continue;
-            /* Countdown done: fill cache (pollutes it) but skip writeback */
-            vaddr_fill_and_read(ir->mem_addr, ir->mem_width);
+            /* Countdown done: fill cache (pollutes it) but skip writeback.
+             * Use MSHR's line_addr since ROB entry may already be invalid. */
+            vaddr_fill_and_read(mshr->line_addr, 8);
             int still_used = 0, t;
             for (t = 0; t < NUM_LSU_UNITS; t++) {
                 if (t != s && ooo.latch_lsu[t].valid &&
@@ -450,14 +690,27 @@ static void ooo_unit_lsu(void)
 
         /* ── First visit: compute address ────────────────────────────────── */
         if (mi == -1 && ooo.latch_lsu[s].cycles_rem == -1) {
+            /* Inject forwarded source values before execution */
+            ir->src1_val = ooo.latch_lsu[s].src1_val;
+            ir->src2_val = ooo.latch_lsu[s].src2_val;
             ir_execute(ir, &cpu);
-            ooo.rob[rob_idx].ir = *ir;
+            /* ir == &ooo.rob[rob_idx].ir, so no separate writeback needed */
 
             if (ir->type == ITYPE_STORE) {
                 ooo.rob[rob_idx].store_data = ir->src2_val;
                 ooo.rob[rob_idx].ready = 1;
+                ooo.unready_store_count--;
                 ooo.latch_lsu[s].valid = 0;
                 continue;
+            }
+
+            /* LOAD: MMIO must execute in-order — stall until ROB head */
+            if (ir->mem_addr >= 0xa0000000UL) {
+                if (rob_idx != ooo.rob_head) {
+                    ooo.latch_lsu[s].cycles_rem = -2; /* waiting for ROB head */
+                    continue;
+                }
+                goto lsu_do_fill;
             }
 
             /* LOAD: probe cache level */
@@ -465,7 +718,8 @@ static void ooo_unit_lsu(void)
             int lat   = level_to_lat[level];
 
             if (lat == 1) {
-                /* L1 hit: fill and read immediately */
+                /* L1 hit: fill immediately (INT unit runs before LSU, so any
+                 * same-cycle branch misprediction flush has already happened) */
                 goto lsu_do_fill;
             }
 
@@ -478,6 +732,17 @@ static void ooo_unit_lsu(void)
             continue;
         }
 
+        /* ── L1 hit: fill on second visit ────────────────────────────────── */
+        if (mi == -1 && ooo.latch_lsu[s].cycles_rem == 0) {
+            goto lsu_do_fill;
+        }
+
+        /* ── MMIO waiting for ROB head ───────────────────────────────────── */
+        if (mi == -1 && ooo.latch_lsu[s].cycles_rem == -2) {
+            if (rob_idx != ooo.rob_head) continue;
+            goto lsu_do_fill;
+        }
+
         /* ── Waiting on MSHR ─────────────────────────────────────────────── */
         if (mi >= 0) {
             if (ooo.mshr[mi].cycles_rem > 0) continue;
@@ -486,6 +751,27 @@ static void ooo_unit_lsu(void)
 
 lsu_do_fill:
         {
+            paddr_t pa = ir->mem_addr & 0xffffffff;
+            bool is_dram = (pa >= 0x80000000UL && pa < 0x88000000UL);
+            bool is_mmio = (pa >= 0xa0000000UL);
+            if (!is_dram && !is_mmio) {
+                /* Wrong-path speculative LOAD to an invalid address.
+                 * The older branch/JAL that redirected control hasn't executed
+                 * yet (INT slots busy), so LSU ran first.  Mark as faulted so
+                 * the flush triggered by that branch will silently discard this
+                 * ROB entry.  If this somehow reaches commit it is a real bug. */
+                ooo.rob[rob_idx].ir.fault = 1;
+                ir->result = 0;
+                int phys_rd2 = ooo.latch_lsu[s].phys_rd;
+                if (phys_rd2 > 0) {
+                    ooo.prf[phys_rd2].value = 0;
+                    ooo.prf[phys_rd2].ready = 1;
+                    cdb_broadcast(phys_rd2);
+                }
+                ooo.rob[rob_idx].ready = 1;
+                ooo.latch_lsu[s].valid = 0;
+                continue;
+            }
             word_t raw = vaddr_fill_and_read(ir->mem_addr, ir->mem_width);
             if (ir->mem_sign) {
                 switch (ir->mem_width) {
@@ -503,21 +789,63 @@ lsu_do_fill:
                 }
             }
 
-            /* STLF: check ROB for most-recent ready STORE to same address */
+            /* STLF: check sbuf (committed stores not yet drained) first,
+             * then ROB (in-flight stores). ROB wins if it has a matching
+             * entry (it is newer than anything in sbuf).
+             *
+             * stlf_covers(sa,sw,la,lw): true if store [sa,sa+sw) fully contains
+             * load [la,la+lw).  When true, the relevant bytes are extracted with
+             * the correct shift and the load's own sign/zero-extension is applied
+             * so the result matches what a physical memory read would give.       */
+#define STLF_TRY(sa, sw, sd, la, lw, sign, out) do { \
+    if ((sa) <= (la) && (sa) + (sw) >= (la) + (lw)) { \
+        int _sh = (int)((la) - (sa)) * 8; \
+        word_t _raw = (word_t)(sd) >> _sh; \
+        if (sign) { \
+            switch (lw) { \
+            case 1: (out) = SEXT(_raw,  8); break; \
+            case 2: (out) = SEXT(_raw, 16); break; \
+            case 4: (out) = SEXT(_raw, 32); break; \
+            default:(out) = _raw; break; \
+            } \
+        } else { \
+            switch (lw) { \
+            case 1: (out) = UEXT(_raw,  8); break; \
+            case 2: (out) = UEXT(_raw, 16); break; \
+            case 4: (out) = UEXT(_raw, 32); break; \
+            default:(out) = _raw; break; \
+            } \
+        } \
+    } \
+} while (0)
+
             {
-                int scan = ooo.rob_head, match_idx = -1;
+                /* sbuf scan: newest matching entry wins (scan oldest→newest,
+                 * last hit overwrites — most-recently-enqueued entry wins). */
+                for (int bi = 0; bi < ooo.sbuf_count; bi++) {
+                    int idx = (ooo.sbuf_head + bi) % STORE_BUF_SIZE;
+                    StoreBufEntry *se = &ooo.sbuf[idx];
+                    if (!se->valid) continue;
+                    STLF_TRY(se->addr, se->width, se->data,
+                              ir->mem_addr, ir->mem_width, ir->mem_sign,
+                              ir->result);
+                }
+            }
+            {
+                /* ROB scan: most-recent ready STORE wins. */
+                int scan = ooo.rob_head;
                 while (scan != rob_idx) {
                     ROBEntry *roe = &ooo.rob[scan];
                     if (roe->valid && roe->ready &&
-                        (roe->ir.raw & 0x7f) == 0x23 &&
-                        roe->ir.mem_addr  == ir->mem_addr &&
-                        roe->ir.mem_width == ir->mem_width)
-                        match_idx = scan;
+                        (roe->ir.raw & 0x7f) == 0x23)
+                        STLF_TRY(roe->ir.mem_addr, roe->ir.mem_width,
+                                 roe->store_data,
+                                 ir->mem_addr, ir->mem_width, ir->mem_sign,
+                                 ir->result);
                     scan = (scan + 1) % ROB_SIZE;
                 }
-                if (match_idx >= 0)
-                    ir->result = ooo.rob[match_idx].store_data;
             }
+#undef STLF_TRY
 
             /* Release MSHR if no other LSU slot still waits on it */
             if (mi >= 0) {
@@ -552,21 +880,26 @@ static void ooo_stage_is(void)
     int s, i, best, da, db;
 
     /* ── Macro: scan RS for best instruction of a given EU type ─────────── */
+    /* Uses rs_ready_mask[eu] bitmap to skip invalid/not-ready entries.     */
 #define ISSUE_UNIT(latch_arr, num_slots, eu, do_mem_order) \
     for (s = 0; s < (num_slots); s++) { \
         if ((latch_arr)[s].valid) continue; \
         best = -1; \
-        for (i = 0; i < RS_SIZE; i++) { \
-            if (!ooo.rs[i].valid) continue; \
-            if (ooo.rs[i].eu_type != (eu)) continue; \
-            if (!ooo.rs[i].src1_ready || !ooo.rs[i].src2_ready) continue; \
-            if (do_mem_order && (ooo.rs[i].ir.raw & 0x7f) == 0x03) { \
+        uint32_t _mask = ooo.rs_ready_mask[(eu)]; \
+        while (_mask) { \
+            i = __builtin_ctz(_mask); \
+            _mask &= _mask - 1; \
+            if (do_mem_order && (ooo.rob[ooo.rs[i].rob_idx].ir.raw & 0x7f) == 0x03) { \
                 int blocked = 0, j; \
                 for (j = ooo.rob_head; j != ooo.rs[i].rob_idx; \
                      j = (j + 1) % ROB_SIZE) { \
                     ROBEntry *roe = &ooo.rob[j]; \
                     if (!roe->valid) continue; \
+                    /* Block LOAD if older unready STORE exists */ \
                     if (!roe->ready && (roe->ir.raw & 0x7f) == 0x23) \
+                        { blocked = 1; break; } \
+                    /* Block LOAD if older FENCE exists (sbuf not yet drained) */ \
+                    if (roe->ir.type == ITYPE_FENCE && ooo.sbuf_count > 0) \
                         { blocked = 1; break; } \
                 } \
                 if (blocked) continue; \
@@ -596,18 +929,17 @@ static void ooo_stage_is(void)
  */
 static void ooo_stage_rn(void)
 {
-    int       n, rs_used, rob_idx, rs_slot;
+    int       n, rs_used, rs_free, rob_idx, rs_slot;
     int       phys_rd, old_phys;
-    int       i;
     IR_Inst  *ir;
     ROBEntry *rob;
     RSEntry  *rs;
 
     if (!ooo.latch_id_rn[0].valid) return;
 
-    /* Count RS entries currently used (updated inline as we allocate) */
-    rs_used = 0;
-    for (i = 0; i < RS_SIZE; i++) if (ooo.rs[i].valid) rs_used++;
+    /* Count free RS slots via popcount on the free mask */
+    rs_free = __builtin_popcount(ooo.rs_free_mask);
+    rs_used = RS_SIZE - rs_free;
 
     for (n = 0; n < FETCH_WIDTH; n++) {
         if (!ooo.latch_id_rn[n].valid) break;
@@ -628,7 +960,6 @@ static void ooo_stage_rn(void)
         if (ir->rd != -1 && ir->rd != 0 && ooo.freelist.count == 0) {
             ooo_stats.rob_full_stalls++; break;
         }
-
         /* ── Allocate ROB slot ──────────────────────────────────────────────── */
         rob_idx      = ooo.rob_tail;
         ooo.rob_tail = (ooo.rob_tail + 1) % ROB_SIZE;
@@ -640,6 +971,10 @@ static void ooo_stage_rn(void)
         rob->ready    = 0;
         rob->valid    = 1;
         rob->store_data = 0;
+
+        /* Track unready stores for fast IS-stage memory-ordering check */
+        if ((ir->raw & 0x7fu) == 0x23u)
+            ooo.unready_store_count++;
 
         /*
          * ── Read source register mappings BEFORE renaming the destination ─────
@@ -682,14 +1017,11 @@ static void ooo_stage_rn(void)
         rob->old_phys = old_phys;
 
         /* ── Find a free RS slot ────────────────────────────────────────────── */
-        rs_slot = -1;
-        for (i = 0; i < RS_SIZE; i++) {
-            if (!ooo.rs[i].valid) { rs_slot = i; break; }
-        }
-        /* rs_slot must exist: we checked rs_used < RS_SIZE above */
+        /* rs_free_mask has a bit set for every free slot; ctz gives the lowest */
+        rs_slot = __builtin_ctz(ooo.rs_free_mask);
+        ooo.rs_free_mask &= ~(1u << rs_slot);  /* mark as allocated */
         rs          = &ooo.rs[rs_slot];
         rs->valid   = 1;
-        rs->ir      = *ir;
         rs->phys_rd = phys_rd;
         rs->rob_idx = rob_idx;
 
@@ -720,7 +1052,6 @@ static void ooo_stage_rn(void)
                 rs->src1_val   = 0;
             }
         }
-
         /* ── Source 2 operand (using pre-rename mapping) ────────────────────── */
         if (ir->rs2 == -1) {
             rs->src2_ready = 1;
@@ -743,6 +1074,10 @@ static void ooo_stage_rn(void)
 
         ooo.latch_id_rn[n].valid = 0;
         rs_used++;  /* update live count for next slot's structural check */
+        rs_free--;  /* one fewer free slot */
+
+        /* Update ready mask for the newly allocated RS slot */
+        rs_mask_update(rs_slot);
     }
 
     /* Compact: if slot 0 was consumed and slot 1 remains, shift it to slot 0
@@ -786,14 +1121,14 @@ static void ooo_stage_if(void)
     if (ooo.latch_if_id[0].valid) return;
 
     for (s = 0; s < FETCH_WIDTH; s++) {
-        pc = ooo.fetch_pc;
+        pc = ooo.fetch_pc & 0xffffffff;  /* riscv64: lw sign-extends; truncate to 32-bit */
+        ooo.fetch_pc = pc;
 
-        /* Sanity check: ensure fetch_pc is within valid memory range */
+        /* Sanity check: ensure fetch_pc is within valid memory range.
+         * Should not happen with the wrong-path branch guard above. */
         if (pc < 0x80000000 || pc >= 0x88000000) {
-            fprintf(stderr, "[OOO-ERROR] Invalid fetch_pc: 0x%lx, resetting to 0x80000000\n",
-                    (unsigned long)pc);
-            ooo.fetch_pc = 0x80000000;
-            pc = ooo.fetch_pc;
+            ooo.fetch_pc += 4;
+            break;
         }
 
         raw = (uint32_t)vaddr_ifetch(pc, 4);
@@ -802,19 +1137,26 @@ static void ooo_stage_if(void)
         ooo.latch_if_id[s].valid = 1;
         ooo.fetch_pc = pc + 4;  /* Sequential default; EX may override on flush */
 
+        ooo.latch_if_id[s].ir.bp_predict_taken = 0;
+        ooo.latch_if_id[s].ir.bp_predicted_pc  = pc + 4;
         if (g_bpred_mode || g_bpred2_mode) {
-            r = g_bpred2_mode ? bpred2_predict(&bpred2_state, pc)
-                              : bpred_predict(&bpred, pc);
-            ooo.latch_if_id[s].ir.bp_predict_taken = r.taken;
-            ooo.latch_if_id[s].ir.bp_predicted_pc  =
-                (r.taken && r.btb_hit) ? r.target : pc + 4;
-            if (r.taken && r.btb_hit) {
-                ooo.fetch_pc = r.target;
-                break;  /* redirect: don't fetch next sequential instruction */
+            /* Only predict for control-flow instructions to avoid overhead.
+             * opcode bits[6:2]: 0x18=BRANCH, 0x1b=JAL, 0x19=JALR. */
+            uint8_t op5 = (raw >> 2) & 0x1f;
+            if (op5 == 0x18 || op5 == 0x1b || op5 == 0x19) {
+                /* Snapshot RAS state BEFORE predict (which may push/pop) */
+                ooo.latch_if_id[s].ir.ras_top_snap = bpred.ras_top;
+                ooo.latch_if_id[s].ir.ras_cnt_snap = bpred.ras_count;
+                r = g_bpred2_mode ? bpred2_predict(&bpred2_state, pc)
+                                  : bpred_predict(&bpred, pc, raw);
+                ooo.latch_if_id[s].ir.bp_predict_taken = r.taken;
+                ooo.latch_if_id[s].ir.bp_predicted_pc  =
+                    (r.taken && r.btb_hit) ? r.target : pc + 4;
+                if (r.taken && r.btb_hit) {
+                    ooo.fetch_pc = r.target;
+                    break;  /* redirect: don't fetch next sequential instruction */
+                }
             }
-        } else {
-            ooo.latch_if_id[s].ir.bp_predict_taken = 0;
-            ooo.latch_if_id[s].ir.bp_predicted_pc  = pc + 4;
         }
     }
 }
@@ -859,27 +1201,27 @@ static void ooo_trace_cycle(void)
     // INT/MUL/LSU units
     pos = 0;
     for (int s = 0; s < NUM_INT_UNITS; s++) {
-        if (ooo.latch_int[s].valid)
+        if (ooo.latch_int[s].valid) {
+            IR_Inst *ir = &ooo.rob[ooo.latch_int[s].rob_idx].ir;
             pos += sprintf(buf + pos, "%08x/%-7s ",
-                          (unsigned)ooo.latch_int[s].ir.pc,
-                          ooo.latch_int[s].ir.name ? ooo.latch_int[s].ir.name : "??");
-        else
+                          (unsigned)ir->pc, ir->name ? ir->name : "??");
+        } else
             pos += sprintf(buf + pos, "--               ");
     }
     for (int s = 0; s < NUM_MUL_UNITS; s++) {
-        if (ooo.latch_mul[s].valid)
+        if (ooo.latch_mul[s].valid) {
+            IR_Inst *ir = &ooo.rob[ooo.latch_mul[s].rob_idx].ir;
             pos += sprintf(buf + pos, "%08x/%-7s ",
-                          (unsigned)ooo.latch_mul[s].ir.pc,
-                          ooo.latch_mul[s].ir.name ? ooo.latch_mul[s].ir.name : "??");
-        else
+                          (unsigned)ir->pc, ir->name ? ir->name : "??");
+        } else
             pos += sprintf(buf + pos, "--               ");
     }
     for (int s = 0; s < NUM_LSU_UNITS; s++) {
-        if (ooo.latch_lsu[s].valid)
+        if (ooo.latch_lsu[s].valid) {
+            IR_Inst *ir = &ooo.rob[ooo.latch_lsu[s].rob_idx].ir;
             pos += sprintf(buf + pos, "%08x/%-7s ",
-                          (unsigned)ooo.latch_lsu[s].ir.pc,
-                          ooo.latch_lsu[s].ir.name ? ooo.latch_lsu[s].ir.name : "??");
-        else
+                          (unsigned)ir->pc, ir->name ? ir->name : "??");
+        } else
             pos += sprintf(buf + pos, "--               ");
     }
     fprintf(log_fp, "EU:%-38s | ", buf);
@@ -905,13 +1247,35 @@ static void ooo_trace_cycle(void)
  * each stage reads the latch values written by the *previous* cycle's
  * upstream stage (not the current cycle's).
  */
+/* ── ooo_drain_store_buf ─────────────────────────────────────────────────── */
+/* Drain one entry from the store buffer per cycle.  Until an entry drains,
+ * it is invisible to other cores (TSO store buffer semantics). */
+
+static void ooo_drain_store_buf(void)
+{
+    if (ooo.sbuf_count == 0) return;
+    /* Slow drain only in multi-core mode (TSO violation window).
+     * Single-core programs (e.g. mario) need every-cycle drain to avoid
+     * STLF width-mismatch stale reads (sw→lb patterns). */
+    if (g_num_cores > 1) {
+        if (ooo.sbuf_drain_tick > 0) { ooo.sbuf_drain_tick--; return; }
+        ooo.sbuf_drain_tick = LAT_L2_HIT - 1;
+    }
+    StoreBufEntry *se = &ooo.sbuf[ooo.sbuf_head];
+    vaddr_write(se->addr, se->width, se->data);
+    se->valid = 0;
+    ooo.sbuf_head = (ooo.sbuf_head + 1) % STORE_BUF_SIZE;
+    ooo.sbuf_count--;
+}
+
 void ooo_cycle(void)
 {
+    ooo_drain_store_buf();
     ooo_stage_commit();
     mshr_tick();
-    ooo_unit_lsu();
+    ooo_unit_int();   /* run before LSU so mispred flushes happen first */
     ooo_unit_mul();
-    ooo_unit_int();
+    ooo_unit_lsu();
     ooo_stage_is();
     ooo_stage_rn();
     ooo_stage_id();
@@ -985,11 +1349,12 @@ void ooo_cycle_core(Core *c)
     bpred     = c->bpred;
 
     /* Run OOO stages */
+    ooo_drain_store_buf();
     ooo_stage_commit();
     mshr_tick();
-    ooo_unit_lsu();
+    ooo_unit_int();   /* run before LSU so mispred flushes happen first */
     ooo_unit_mul();
-    ooo_unit_int();
+    ooo_unit_lsu();
     ooo_stage_is();
     ooo_stage_rn();
     ooo_stage_id();

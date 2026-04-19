@@ -60,9 +60,8 @@ typedef struct {
 
 typedef struct {
     int     valid;
-    IR_Inst ir;
     int     phys_rd;    /* Target physical register (-1 = none)             */
-    int     rob_idx;    /* Corresponding ROB slot                           */
+    int     rob_idx;    /* Corresponding ROB slot (IR is read from rob[])   */
     int     src1_ready; word_t src1_val; int src1_ptag;
     int     src2_ready; word_t src2_val; int src2_ptag;
     int     cycles_rem; /* Remaining execution cycles (counts down to 0)   */
@@ -82,13 +81,14 @@ typedef struct {
 
 /* ── IS→EX and EX→MEM latches (carry phys_rd and rob_idx alongside IR) ──── */
 typedef struct {
-    IR_Inst ir;
+    int     rob_idx;   /* ROB slot; IR is read via ooo.rob[rob_idx].ir (no copy) */
     int     phys_rd;
-    int     rob_idx;
     int     valid;
     int     cycles_rem; /* countdown for multi-cycle MEM stage (loads only) */
     int     mshr_idx;   /* index into ooo.mshr[], or -1 if not using MSHR   */
     int     flushed;    /* 1 = ROB was flushed but MSHR fill should complete */
+    word_t  src1_val;   /* forwarded source values (overrides ROB ir.src*_val) */
+    word_t  src2_val;
 } OOOLatch;
 
 /* ── Statistics ──────────────────────────────────────────────────────────── */
@@ -102,6 +102,20 @@ typedef struct {
     uint64_t eu_contention_stalls;  /* Cycles stalled due to execution unit full */
     uint64_t branch_penalty_cycles; /* Total ROB entries flushed on mispredicts */
 } OOOStats;
+
+/* ── Per-core store buffer (TSO model) ──────────────────────────────────── */
+/* Committed stores are buffered here and drain to cache one per cycle.
+ * Other cores cannot see the store until it drains (globally visible).
+ * Same-core LOADs check this buffer first (STLF for committed stores).
+ * FENCE stalls commit until the buffer is empty. */
+#define STORE_BUF_SIZE 16
+
+typedef struct {
+    vaddr_t addr;
+    word_t  data;
+    int     width;
+    int     valid;
+} StoreBufEntry;
 
 /* ── Top-level OOO engine state ──────────────────────────────────────────── */
 typedef struct {
@@ -119,6 +133,16 @@ typedef struct {
 
     /* Reservation stations */
     RSEntry  rs[RS_SIZE];
+    int      unready_store_count; /* # of STOREs in ROB with ready=0; maintained
+                                   * incrementally to avoid O(ROB) scan per LOAD */
+    /* Per-EU-type bitmask of RS slots that are valid AND have both sources ready.
+     * Bit i set ↔ rs[i].valid && src1_ready && src2_ready && eu_type == EU_x.
+     * Maintained by CDB broadcast, issue, flush, and rename. Lets IS stage
+     * skip invalid/not-ready entries without scanning all RS_SIZE slots. */
+    uint32_t rs_ready_mask[3];  /* [EU_INT], [EU_MUL], [EU_LSU] */
+    /* Bitmask of FREE RS slots (bit i set ↔ rs[i].valid == 0).
+     * Maintained incrementally; replaces O(RS_SIZE) scan in RN and cdb_broadcast. */
+    uint32_t rs_free_mask;
 
     /* Pipeline latches: front-end FETCH_WIDTH-wide, back-end per functional unit */
     PipeReg  latch_if_id[FETCH_WIDTH];          /* IF → ID                   */
@@ -136,6 +160,13 @@ typedef struct {
     MSHREntry mshr[MSHR_SIZE];
 
     vaddr_t  fetch_pc;      /* PC of the next instruction to fetch            */
+
+    /* Per-core store buffer (TSO) */
+    StoreBufEntry sbuf[STORE_BUF_SIZE];
+    int           sbuf_head;
+    int           sbuf_tail;
+    int           sbuf_count;
+    int           sbuf_drain_tick;  /* cycles remaining until next drain */
 } OOOState;
 
 /* ── Globals ──────────────────────────────────────────────────────────────── */

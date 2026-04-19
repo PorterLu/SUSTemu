@@ -1,14 +1,14 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <readline/readline.h>
 #include <readline/history.h>
 #include <sdb.h>
 #include <state.h>
-#include <stdlib.h>
 #include <utils.h>
 #include <common.h>
 #include <log.h>
 #include <exec.h>
-#include <utils.h>
-#include <string.h>
 #include <reg.h>
 #include <expr.h>
 #include <vmem.h>

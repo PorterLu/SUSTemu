@@ -69,6 +69,9 @@ typedef struct IR_Inst {
     /* ── Branch prediction annotation (Phase 3) ──────────── */
     int         bp_predict_taken;
     vaddr_t     bp_predicted_pc;
+    /* RAS snapshot at time of fetch: restored on misprediction flush */
+    int         ras_top_snap;
+    int         ras_cnt_snap;
 
     /* ── Pipeline control flags (Phase 4+) ───────────────── */
     int         serializing; /* 1 = must drain ROB before issue (CSR/ecall/mret) */

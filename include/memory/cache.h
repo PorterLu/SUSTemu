@@ -19,6 +19,7 @@ typedef struct {
 
 typedef struct {
     CacheLine *lines;
+    int mru_way;   /* way index of the most recently accessed line (-1 = none) */
 } CacheSet;
 
 typedef struct {

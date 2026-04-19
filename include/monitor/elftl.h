@@ -1,6 +1,8 @@
 #ifndef __ELFTL_H__
 #define __ELFTL_H__
 
+extern int g_ftrace_en;  /* set to 1 to enable ftrace collection */
+
 void init_elf(const char* elf_file);
 
 //通过函数名，找到的地址

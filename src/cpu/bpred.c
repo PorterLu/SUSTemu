@@ -33,9 +33,61 @@ void bpred_init(BranchPredictor *bp)
 }
 
 /* ── bpred_predict ───────────────────────────────────────────────────────── */
-BPredResult bpred_predict(BranchPredictor *bp, vaddr_t pc)
+/*
+ * Classify the instruction at `pc` (raw bits `raw`) for RAS handling:
+ *   call: JAL with rd==ra(x1) or rd==t0(x5)          opcode=0x6f, rd∈{1,5}
+ *         JALR with rd==ra, rs1≠ra                    opcode=0x67, rd∈{1,5}
+ *   ret:  JALR with rd==x0, rs1==ra(x1) or rs1==t0   opcode=0x67, rd∈{0}, rs1∈{1,5}
+ *
+ * On call: push pc+4 onto RAS; use BTB for target.
+ * On ret:  pop RAS and use as predicted target (override BTB).
+ */
+static inline int is_call(uint32_t raw) {
+    /* JAL rd=1 or rd=5 */
+    if ((raw & 0x7f) == 0x6f) {
+        int rd = (raw >> 7) & 0x1f;
+        return (rd == 1 || rd == 5);
+    }
+    /* JALR rd=1 or rd=5, rs1 != rd */
+    if ((raw & 0x707f) == 0x0067) {
+        int rd  = (raw >> 7)  & 0x1f;
+        int rs1 = (raw >> 15) & 0x1f;
+        return ((rd == 1 || rd == 5) && rs1 != rd);
+    }
+    return 0;
+}
+static inline int is_ret(uint32_t raw) {
+    /* JALR rd=x0, rs1=ra(1) or rs1=t0(5), imm=0 */
+    if ((raw & 0x707f) == 0x0067) {
+        int rd  = (raw >> 7)  & 0x1f;
+        int rs1 = (raw >> 15) & 0x1f;
+        return (rd == 0 && (rs1 == 1 || rs1 == 5));
+    }
+    return 0;
+}
+
+BPredResult bpred_predict(BranchPredictor *bp, vaddr_t pc, uint32_t raw)
 {
     BPredResult r = {0, 0, 0};
+
+    /* ── RAS: ret → pop and use as target ──────────────────────────────────── */
+    if (is_ret(raw) && bp->ras_count > 0) {
+        r.taken   = 1;
+        r.btb_hit = 1;  /* signal that we have a valid target */
+        r.target  = bp->ras[bp->ras_top];
+        bp->ras_top   = (bp->ras_top - 1 + RAS_SIZE) % RAS_SIZE;
+        bp->ras_count--;
+        return r;  /* skip BTB/tournament for rets */
+    }
+
+    /* ── RAS: call → push return address ──────────────────────────────────── */
+    if (is_call(raw)) {
+        int new_top = (bp->ras_top + 1) % RAS_SIZE;
+        bp->ras[new_top]  = pc + 4;
+        bp->ras_top       = new_top;
+        if (bp->ras_count < RAS_SIZE) bp->ras_count++;
+        /* Fall through to BTB for target prediction of the call itself */
+    }
 
     /* 1. BTB lookup ──────────────────────────────────────────────────────── */
     uint32_t bi = (pc >> 2) & (BTB_SIZE - 1);

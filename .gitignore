@@ -11,3 +11,31 @@ test/**/*.o
 test/**/*.d
 .metals/
 .DS_STORE
+
+# litenes (NES emulator) build output — track only the final binary/elf
+litenes/build/riscv64-nemu/
+
+# Lab benchmark build artifacts
+ooo_lab/**/*.bin
+ooo_lab/**/*.elf
+ooo_lab/**/*.o
+ooo_lab/**/*.d
+predictor_lab/**/*.bin
+predictor_lab/**/*.elf
+predictor_lab/**/*.o
+predictor_lab/**/*.d
+predictor_lab/**/*.dis
+predictor_lab/**/*.dbg.elf
+order_lab/**/*.bin
+order_lab/**/*.elf
+order_lab/**/*.o
+order_lab/**/*.d
+
+cache_lab/**/*.bin
+cache_lab/**/*.elf
+cache_lab/**/*.o
+cache_lab/**/*.d
+
+# perf profiling data
+perf.data
+perf.data.old

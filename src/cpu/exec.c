@@ -66,17 +66,18 @@ static void exec_once()
 	g_sim_instret++;
 
 	/* ── Instruction trace (same format as before) ─────────────── */
-	sprintf(log_buf, "%016lx:    ", pc);
-	for (int i = 0; i < 4; i++)
-		sprintf(log_buf + 21 + 3 * i, "%02x ", *(((uint8_t *)&raw) + 3 - i));
-	sprintf(log_buf + 33, "   ");
-	disassemble(log_buf + 36, 70, pc, (uint8_t *)(&raw), 4);
+	if (g_print_step || log_fp) {
+		sprintf(log_buf, "%016lx:    ", pc);
+		for (int i = 0; i < 4; i++)
+			sprintf(log_buf + 21 + 3 * i, "%02x ", *(((uint8_t *)&raw) + 3 - i));
+		sprintf(log_buf + 33, "   ");
+		disassemble(log_buf + 36, 70, pc, (uint8_t *)(&raw), 4);
 
-	if (g_print_step)
-		printf("%s\n", log_buf);
-	log_write("%s\n", log_buf);
-
-	add_ringbuf_inst(log_buf);
+		if (g_print_step)
+			printf("%s\n", log_buf);
+		log_write("%s\n", log_buf);
+		add_ringbuf_inst(log_buf);
+	}
 
 	/*****************************vga更新***************************************
 	 * 每隔一段时间将vga屏幕上的信息进行更新                                         *
@@ -137,6 +138,12 @@ void exec(uint64_t n)
 			cores_initialised = 1;
 			for (int i = 0; i < g_num_cores; i++) {
 				Core *c = &cores[i];
+				/* Install this core's context before init so cache globals are valid */
+				g_current_hartid = c->core_id;
+				cpu   = c->cpu;
+				csr   = c->csr;
+				L1I_cache = c->l1i;
+				L1D_cache = c->l1d;
 				if (c->mode == CORE_MODE_INORDER)
 					pipeline_init_core(c);
 				else if (c->mode == CORE_MODE_OOO)
@@ -149,7 +156,7 @@ void exec(uint64_t n)
 			for (int i = 0; i < g_num_cores; i++) {
 				core_cycle(&cores[i]);
 				total++;
-				if (check_wp() && state != NEMU_ABORT)
+				if (wp_any_active() && check_wp() && state != NEMU_ABORT)
 					state = NEMU_STOP;
 				if (state != NEMU_RUNNING) break;
 			}
@@ -161,8 +168,36 @@ void exec(uint64_t n)
 		ooo_init();
 		while (ooo_stats.insts < n && state == NEMU_RUNNING) {
 			ooo_cycle();
-			if (check_wp() && state != NEMU_ABORT)
+			if (wp_any_active() && check_wp() && state != NEMU_ABORT)
 				state = NEMU_STOP;
+#ifdef CONFIG_timer
+			static uint64_t ooo_last = 0;
+			static uint64_t ooo_cycle_ctr = 0;
+			if ((++ooo_cycle_ctr & 4095) == 0) {
+				uint64_t ooo_now = get_time();
+				if ((ooo_now - ooo_last) >= 1000000 / 60) {
+					ooo_last = ooo_now;
+#ifdef CONFIG_gpu
+					vga_update_screen();
+#endif
+#ifdef CONFIG_keyboard
+					SDL_Event event;
+					while (SDL_PollEvent(&event)) {
+						switch (event.type) {
+						case SDL_QUIT: state = NEMU_QUIT; break;
+						case SDL_KEYDOWN:
+						case SDL_KEYUP: {
+							uint8_t k = event.key.keysym.scancode;
+							send_key(k, event.key.type == SDL_KEYDOWN);
+							break;
+						}
+						default: break;
+						}
+					}
+#endif
+				}
+			}
+#endif
 		}
 		ooo_report();
 	} else if (g_inorder_mode) {
@@ -170,15 +205,43 @@ void exec(uint64_t n)
 		pipeline_init();
 		while (pipe_stats.insts < n && state == NEMU_RUNNING) {
 			pipeline_cycle();
-			if (check_wp() && state != NEMU_ABORT)
+			if (wp_any_active() && check_wp() && state != NEMU_ABORT)
 				state = NEMU_STOP;
+#ifdef CONFIG_timer
+			static uint64_t pip_last = 0;
+			static uint64_t pip_cycle_ctr = 0;
+			if ((++pip_cycle_ctr & 4095) == 0) {
+				uint64_t pip_now = get_time();
+				if ((pip_now - pip_last) >= 1000000 / 60) {
+					pip_last = pip_now;
+#ifdef CONFIG_gpu
+					vga_update_screen();
+#endif
+#ifdef CONFIG_keyboard
+					SDL_Event event;
+					while (SDL_PollEvent(&event)) {
+						switch (event.type) {
+						case SDL_QUIT: state = NEMU_QUIT; break;
+						case SDL_KEYDOWN:
+						case SDL_KEYUP: {
+							uint8_t k = event.key.keysym.scancode;
+							send_key(k, event.key.type == SDL_KEYDOWN);
+							break;
+						}
+						default: break;
+						}
+					}
+#endif
+				}
+			}
+#endif
 		}
 		pipeline_report();
 	} else {
 		/* ── Functional simulation mode (default) ────────── */
 		for (; n > 0; n--) {
 			exec_once();
-			if (check_wp() && state != NEMU_ABORT)
+			if (wp_any_active() && check_wp() && state != NEMU_ABORT)
 				state = NEMU_STOP;
 			if (state != NEMU_RUNNING)
 				break;

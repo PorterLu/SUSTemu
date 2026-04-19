@@ -22,10 +22,19 @@ typedef struct {
 
 /* ── Whole-pipeline state ───────────────────────────────────────────────── */
 typedef struct {
-    PipeReg  id;             /* IF→ID latch  (instruction fetched, awaiting decode) */
-    PipeReg  ex;             /* ID→EX latch  (decoded, awaiting execution)           */
-    PipeReg  mem;            /* EX→MEM latch (executed, awaiting memory access)      */
-    PipeReg  wb;             /* MEM→WB latch (memory done, awaiting writeback)        */
+    /* Pointers to the four inter-stage latches.  Each cycle the pipeline
+     * rotates these pointers instead of copying 160-byte IR_Inst structs:
+     *   new_wb  = old mem
+     *   new_mem = old ex
+     *   new_ex  = old id
+     *   new_id  = old wb   (recycled slot, refilled by IF)
+     *
+     * The backing store is slots[4]; rotate_latches() swaps the pointers. */
+    PipeReg *id;             /* IF→ID latch  (instruction fetched, awaiting decode) */
+    PipeReg *ex;             /* ID→EX latch  (decoded, awaiting execution)           */
+    PipeReg *mem;            /* EX→MEM latch (executed, awaiting memory access)      */
+    PipeReg *wb;             /* MEM→WB latch (memory done, awaiting writeback)        */
+    PipeReg  slots[4];       /* Backing store for the four latches                   */
     vaddr_t  fetch_pc;       /* IF stage: address of the next instruction to fetch    */
     int      mem_stall_rem;  /* Remaining cache-miss stall cycles (0 = not stalling)  */
 } Pipeline;
@@ -40,7 +49,7 @@ typedef struct {
 } PipeStats;
 
 /* ── Globals (defined in pipeline.c) ───────────────────────────────────── */
-extern Pipeline  pipe;
+extern Pipeline  cpu_pipe;
 extern PipeStats pipe_stats;
 
 /* ── API ────────────────────────────────────────────────────────────────── */

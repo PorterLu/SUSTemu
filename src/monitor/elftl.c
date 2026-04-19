@@ -5,6 +5,8 @@
 #include <string.h>
 #include <elftl.h>
 
+int g_ftrace_en = 0;  /* disabled by default; set to 1 to enable ftrace collection */
+
 static char *strtab = NULL;
 static Elf64_Sym *symtab = NULL;
 static int nr_symtab_entry;
@@ -127,6 +129,7 @@ char* findFunc(uint64_t addr)
  *************************************************************************************/
 void add_ftrace(uint64_t addr, bool is_call)
 {
+	if (!g_ftrace_en) return;
 	ftrace_element *pointer = (ftrace_element*)malloc(sizeof(ftrace_element));
 	pointer->addr = addr;
 	pointer->is_call = is_call;
