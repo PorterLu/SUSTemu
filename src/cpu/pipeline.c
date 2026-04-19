@@ -293,7 +293,9 @@ static void stage_EX(void)
     /* The ex slot (with execution results) will become mem after rotate. */
 
     if (g_bpred_mode) {
-        bpred_update(&bpred, ir);
+        uint8_t op5 = (ir->raw >> 2) & 0x1f;
+        if (op5 == 0x18 || op5 == 0x1b || op5 == 0x19)
+            bpred_update(&bpred, ir);
         if (ir->dnpc != ir->bp_predicted_pc) {
             cpu_pipe.id->valid   = 0;   /* flush wrongly-speculated instruction in ID */
             g_fetch_slot->valid  = 0;   /* also kill any fetch that IF hasn't done yet */
