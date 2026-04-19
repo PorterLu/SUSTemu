@@ -12,8 +12,8 @@ test/**/*.d
 .metals/
 .DS_STORE
 
-# litenes (NES emulator) build output
-litenes/build/
+# litenes (NES emulator) build output — track only the final binary/elf
+litenes/build/riscv64-nemu/
 
 # Lab benchmark build artifacts
 ooo_lab/**/*.bin
