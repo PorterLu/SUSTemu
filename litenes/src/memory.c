@@ -32,7 +32,7 @@ void memory_writeb(word address, byte data) {
 }
 
 word memory_readw(word address) {
-  return memory_readb_fast(address) + (memory_readb_fast(address + 1) << 8);
+  return memory_readb(address) + (memory_readb(address + 1) << 8);
 }
 
 void memory_writew(word address, word data) {

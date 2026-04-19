@@ -128,56 +128,48 @@ void ppu_ram_write(word address, byte data) {
 // Rendering
 
 void ppu_draw_background_scanline(bool mirror) {
-  if (!candraw_fast()) return;  /* skipped frame — no draw, no sprite-0 bg update */
-
-  word base_nt = ppu_base_nametable_address() + (mirror ? 0x400 : 0);
-  int screen_y = ppu.scanline + 1;
-  bool top  = (ppu.scanline & 31) < 16;
-  int top_shift  = top  ? 0 : 4;
-
   int tile_x;
   for (tile_x = ppu_shows_background_in_leftmost_8px() ? 0 : 1; tile_x < 32; tile_x ++) {
-    /* Skipping off-screen tiles */
-    int base_screen_x = (tile_x << 3) - ppu.PPUSCROLL_X + (mirror ? 256 : 0);
-    if (base_screen_x > 256)
+    // Skipping off-screen pixels
+    if (((tile_x << 3) - ppu.PPUSCROLL_X + (mirror ? 256 : 0)) > 256)
       continue;
 
     int tile_y = ppu.scanline >> 3;
-    int tile_index = ppu_ram_read(base_nt + tile_x + (tile_y << 5));
+    int tile_index = ppu_ram_read(ppu_base_nametable_address() + tile_x + (tile_y << 5) + (mirror ? 0x400 : 0));
     word tile_address = ppu_background_pattern_table_address() + 16 * tile_index;
 
     int y_in_tile = ppu.scanline & 0x7;
     byte l = ppu_ram_read(tile_address + y_in_tile);
     byte h = ppu_ram_read(tile_address + y_in_tile + 8);
 
-    /* Hoist attribute/palette computation outside pixel loop */
-    word attribute_address = base_nt + 0x3C0 + (tile_x >> 2) + (ppu.scanline >> 5) * 8;
-    bool left = (tile_x & 3) < 2;
-    int left_shift = left ? 0 : 2;
-    byte palette_attribute = (ppu_ram_read(attribute_address) >> (top_shift + left_shift)) & 3;
-    word palette_address = 0x3F00 + (palette_attribute << 2);
-    /* Precompute palette indices for color values 1,2,3 */
-    int pal[4];
-    pal[0] = 0; /* unused — transparent */
-    pal[1] = ppu_ram_read(palette_address + 1);
-    pal[2] = ppu_ram_read(palette_address + 2);
-    pal[3] = ppu_ram_read(palette_address + 3);
-
     int x;
     for (x = 0; x < 8; x ++) {
       byte color = ppu_l_h_addition_table[l][h][x];
 
+      // Color 0 is transparent
       if (color != 0) {
+        word attribute_address = (ppu_base_nametable_address() + (mirror ? 0x400 : 0) + 0x3C0 + (tile_x >> 2) + (ppu.scanline >> 5) * 8);
+        bool top = (ppu.scanline % 32) < 16;
+        bool left = (tile_x % 4 < 2);
+
+        byte palette_attribute = ppu_ram_read(attribute_address);
+
+        if (!top) { palette_attribute >>= 4; }
+        if (!left) { palette_attribute >>= 2; }
+        palette_attribute &= 3;
+
+        word palette_address = 0x3F00 + (palette_attribute << 2);
+        int idx = ppu_ram_read(palette_address + color);
+
         ppu_screen_background[(tile_x << 3) + x][ppu.scanline] = color;
-        draw_inline(base_screen_x + x, screen_y, pal[color]);
+
+        draw((tile_x << 3) + x - ppu.PPUSCROLL_X + (mirror ? 256 : 0), ppu.scanline + 1, idx); // bg
       }
     }
   }
 }
 
 void ppu_draw_sprite_scanline() {
-  if (!candraw_fast()) return;
-
   int scanline_sprite_count = 0;
   int n;
   for (n = 0; n < 0x100; n += 4) {
@@ -206,14 +198,6 @@ void ppu_draw_sprite_scanline() {
 
     byte palette_attribute = PPU_SPRRAM[n + 2] & 0x3;
     word palette_address = 0x3F10 + (palette_attribute << 2);
-    /* Hoist palette lookup outside pixel loop */
-    int pal[4];
-    pal[0] = 0;
-    pal[1] = ppu_ram_read(palette_address + 1);
-    pal[2] = ppu_ram_read(palette_address + 2);
-    pal[3] = ppu_ram_read(palette_address + 3);
-
-    int screen_y = sprite_y + y_in_tile + 1;
     int x;
     for (x = 0; x < 8; x ++) {
       int color = hflip ? ppu_l_h_addition_flip_table[l][h][x] : ppu_l_h_addition_table[l][h][x];
@@ -221,10 +205,15 @@ void ppu_draw_sprite_scanline() {
       // Color 0 is transparent
       if (color != 0) {
         int screen_x = sprite_x + x;
-        int idx = pal[color];
+        int idx = ppu_ram_read(palette_address + color);
 
         // FIXME: we do not distinguish bbg and fg here to improve performance
-        draw_inline(screen_x, screen_y, idx);
+        if (PPU_SPRRAM[n + 2] & 0x20) {
+          draw(screen_x, sprite_y + y_in_tile + 1, idx); // bbg
+        }
+        else {
+          draw(screen_x, sprite_y + y_in_tile + 1, idx); // fg
+        }
 
         // Checking sprite 0 hit
         if (ppu_shows_background() && !ppu_sprite_hit_occured && n == 0 && ppu_screen_background[screen_x][sprite_y + y_in_tile] == color) {

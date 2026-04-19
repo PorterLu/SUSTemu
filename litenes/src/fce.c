@@ -6,10 +6,9 @@
 #include <klib.h>
 
 static int frame_cnt;
-int g_frame_cnt;
 static inline bool candraw() { return frame_cnt % (1 + FRAME_SKIP) == 0; }
 
-uint32_t canvas[SCR_W * SCR_H];
+static uint32_t canvas[SCR_W * SCR_H];
 
 void draw(int x, int y, int idx) {
   if (x >= 0 && x < SCR_W && y >= 0 && y < SCR_H && candraw()) {
@@ -125,7 +124,6 @@ void fce_run() {
 
 void fce_update_screen() {
   frame_cnt++;
-  g_frame_cnt = frame_cnt;
   if (!candraw()) return;
 
   int idx = ppu_ram_read(0x3F00);
@@ -138,8 +136,5 @@ void fce_update_screen() {
 
   io_write(AM_GPU_FBDRAW, xpad, ypad, canvas, SCR_W, SCR_H, true);
 
-  /* Clear canvas with 64-bit fill (2 pixels per iteration) */
-  uint64_t fill64 = ((uint64_t)bgc << 32) | bgc;
-  uint64_t *p64 = (uint64_t *)canvas;
-  for (int i = 0; i < SCR_W * SCR_H / 2; i++) p64[i] = fill64;
+  for (int i = 0; i < SCR_W * SCR_H; i ++) canvas[i] = bgc;
 }
