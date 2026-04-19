@@ -393,15 +393,21 @@ static void stage_IF(void)
     g_fetch_slot->valid = 1;
     cpu_pipe.fetch_pc   = pc + 4;
 
+    g_fetch_slot->ir.bp_predict_taken = 0;
+    g_fetch_slot->ir.bp_predicted_pc  = pc + 4;
     if (g_bpred_mode) {
-        BPredResult r = bpred_predict(&bpred, pc, raw);
-        g_fetch_slot->ir.bp_predict_taken = r.taken;
-        g_fetch_slot->ir.bp_predicted_pc  = (r.taken && r.btb_hit) ? r.target : pc + 4;
-        if (r.taken && r.btb_hit)
-            cpu_pipe.fetch_pc = r.target;
-    } else {
-        g_fetch_slot->ir.bp_predict_taken = 0;
-        g_fetch_slot->ir.bp_predicted_pc  = pc + 4;
+        /* Only call bpred for control-flow instructions (BRANCH/JAL/JALR).
+         * opcode bits[6:2]: 0x18=BRANCH, 0x1b=JAL, 0x19=JALR.
+         * Non-control instructions cannot redirect fetch_pc, so skip the
+         * BTB/predictor lookup to avoid ~7% bpred_predict overhead. */
+        uint8_t op5 = (raw >> 2) & 0x1f;
+        if (op5 == 0x18 || op5 == 0x1b || op5 == 0x19) {
+            BPredResult r = bpred_predict(&bpred, pc, raw);
+            g_fetch_slot->ir.bp_predict_taken = r.taken;
+            g_fetch_slot->ir.bp_predicted_pc  = (r.taken && r.btb_hit) ? r.target : pc + 4;
+            if (r.taken && r.btb_hit)
+                cpu_pipe.fetch_pc = r.target;
+        }
     }
 }
 

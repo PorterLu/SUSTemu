@@ -1106,22 +1106,26 @@ static void ooo_stage_if(void)
         ooo.latch_if_id[s].valid = 1;
         ooo.fetch_pc = pc + 4;  /* Sequential default; EX may override on flush */
 
+        ooo.latch_if_id[s].ir.bp_predict_taken = 0;
+        ooo.latch_if_id[s].ir.bp_predicted_pc  = pc + 4;
         if (g_bpred_mode || g_bpred2_mode) {
-            /* Snapshot RAS state BEFORE predict (which may push/pop) */
-            ooo.latch_if_id[s].ir.ras_top_snap = bpred.ras_top;
-            ooo.latch_if_id[s].ir.ras_cnt_snap = bpred.ras_count;
-            r = g_bpred2_mode ? bpred2_predict(&bpred2_state, pc)
-                              : bpred_predict(&bpred, pc, raw);
-            ooo.latch_if_id[s].ir.bp_predict_taken = r.taken;
-            ooo.latch_if_id[s].ir.bp_predicted_pc  =
-                (r.taken && r.btb_hit) ? r.target : pc + 4;
-            if (r.taken && r.btb_hit) {
-                ooo.fetch_pc = r.target;
-                break;  /* redirect: don't fetch next sequential instruction */
+            /* Only predict for control-flow instructions to avoid overhead.
+             * opcode bits[6:2]: 0x18=BRANCH, 0x1b=JAL, 0x19=JALR. */
+            uint8_t op5 = (raw >> 2) & 0x1f;
+            if (op5 == 0x18 || op5 == 0x1b || op5 == 0x19) {
+                /* Snapshot RAS state BEFORE predict (which may push/pop) */
+                ooo.latch_if_id[s].ir.ras_top_snap = bpred.ras_top;
+                ooo.latch_if_id[s].ir.ras_cnt_snap = bpred.ras_count;
+                r = g_bpred2_mode ? bpred2_predict(&bpred2_state, pc)
+                                  : bpred_predict(&bpred, pc, raw);
+                ooo.latch_if_id[s].ir.bp_predict_taken = r.taken;
+                ooo.latch_if_id[s].ir.bp_predicted_pc  =
+                    (r.taken && r.btb_hit) ? r.target : pc + 4;
+                if (r.taken && r.btb_hit) {
+                    ooo.fetch_pc = r.target;
+                    break;  /* redirect: don't fetch next sequential instruction */
+                }
             }
-        } else {
-            ooo.latch_if_id[s].ir.bp_predict_taken = 0;
-            ooo.latch_if_id[s].ir.bp_predicted_pc  = pc + 4;
         }
     }
 }
