@@ -1225,8 +1225,13 @@ static void ooo_trace_cycle(void)
 static void ooo_drain_store_buf(void)
 {
     if (ooo.sbuf_count == 0) return;
-    if (ooo.sbuf_drain_tick > 0) { ooo.sbuf_drain_tick--; return; }
-    ooo.sbuf_drain_tick = LAT_L2_HIT - 1;  /* drain one entry every L2-hit cycles */
+    /* Slow drain only in multi-core mode (TSO violation window).
+     * Single-core programs (e.g. mario) need every-cycle drain to avoid
+     * STLF width-mismatch stale reads (sw→lb patterns). */
+    if (g_num_cores > 1) {
+        if (ooo.sbuf_drain_tick > 0) { ooo.sbuf_drain_tick--; return; }
+        ooo.sbuf_drain_tick = LAT_L2_HIT - 1;
+    }
     StoreBufEntry *se = &ooo.sbuf[ooo.sbuf_head];
     vaddr_write(se->addr, se->width, se->data);
     se->valid = 0;
