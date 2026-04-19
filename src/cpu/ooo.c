@@ -791,32 +791,61 @@ lsu_do_fill:
 
             /* STLF: check sbuf (committed stores not yet drained) first,
              * then ROB (in-flight stores). ROB wins if it has a matching
-             * entry (it is newer than anything in sbuf). */
+             * entry (it is newer than anything in sbuf).
+             *
+             * stlf_covers(sa,sw,la,lw): true if store [sa,sa+sw) fully contains
+             * load [la,la+lw).  When true, the relevant bytes are extracted with
+             * the correct shift and the load's own sign/zero-extension is applied
+             * so the result matches what a physical memory read would give.       */
+#define STLF_TRY(sa, sw, sd, la, lw, sign, out) do { \
+    if ((sa) <= (la) && (sa) + (sw) >= (la) + (lw)) { \
+        int _sh = (int)((la) - (sa)) * 8; \
+        word_t _raw = (word_t)(sd) >> _sh; \
+        if (sign) { \
+            switch (lw) { \
+            case 1: (out) = SEXT(_raw,  8); break; \
+            case 2: (out) = SEXT(_raw, 16); break; \
+            case 4: (out) = SEXT(_raw, 32); break; \
+            default:(out) = _raw; break; \
+            } \
+        } else { \
+            switch (lw) { \
+            case 1: (out) = UEXT(_raw,  8); break; \
+            case 2: (out) = UEXT(_raw, 16); break; \
+            case 4: (out) = UEXT(_raw, 32); break; \
+            default:(out) = _raw; break; \
+            } \
+        } \
+    } \
+} while (0)
+
             {
-                /* sbuf scan: find most-recently-enqueued entry at same addr */
+                /* sbuf scan: newest matching entry wins (scan oldest→newest,
+                 * last hit overwrites — most-recently-enqueued entry wins). */
                 for (int bi = 0; bi < ooo.sbuf_count; bi++) {
                     int idx = (ooo.sbuf_head + bi) % STORE_BUF_SIZE;
                     StoreBufEntry *se = &ooo.sbuf[idx];
-                    if (se->valid && se->addr == ir->mem_addr &&
-                        se->width == ir->mem_width)
-                        ir->result = se->data;
+                    if (!se->valid) continue;
+                    STLF_TRY(se->addr, se->width, se->data,
+                              ir->mem_addr, ir->mem_width, ir->mem_sign,
+                              ir->result);
                 }
             }
             {
-                /* ROB scan: find most-recent ready STORE to same address */
-                int scan = ooo.rob_head, match_idx = -1;
+                /* ROB scan: most-recent ready STORE wins. */
+                int scan = ooo.rob_head;
                 while (scan != rob_idx) {
                     ROBEntry *roe = &ooo.rob[scan];
                     if (roe->valid && roe->ready &&
-                        (roe->ir.raw & 0x7f) == 0x23 &&
-                        roe->ir.mem_addr  == ir->mem_addr &&
-                        roe->ir.mem_width == ir->mem_width)
-                        match_idx = scan;
+                        (roe->ir.raw & 0x7f) == 0x23)
+                        STLF_TRY(roe->ir.mem_addr, roe->ir.mem_width,
+                                 roe->store_data,
+                                 ir->mem_addr, ir->mem_width, ir->mem_sign,
+                                 ir->result);
                     scan = (scan + 1) % ROB_SIZE;
                 }
-                if (match_idx >= 0)
-                    ir->result = ooo.rob[match_idx].store_data;
             }
+#undef STLF_TRY
 
             /* Release MSHR if no other LSU slot still waits on it */
             if (mi >= 0) {
