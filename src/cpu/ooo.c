@@ -861,17 +861,19 @@ static void ooo_stage_is(void)
             i = __builtin_ctz(_mask); \
             _mask &= _mask - 1; \
             if (do_mem_order && (ooo.rob[ooo.rs[i].rob_idx].ir.raw & 0x7f) == 0x03) { \
-                if (ooo.unready_store_count > 0) { \
-                    int blocked = 0, j; \
-                    for (j = ooo.rob_head; j != ooo.rs[i].rob_idx; \
-                         j = (j + 1) % ROB_SIZE) { \
-                        ROBEntry *roe = &ooo.rob[j]; \
-                        if (!roe->valid) continue; \
-                        if (!roe->ready && (roe->ir.raw & 0x7f) == 0x23) \
-                            { blocked = 1; break; } \
-                    } \
-                    if (blocked) continue; \
+                int blocked = 0, j; \
+                for (j = ooo.rob_head; j != ooo.rs[i].rob_idx; \
+                     j = (j + 1) % ROB_SIZE) { \
+                    ROBEntry *roe = &ooo.rob[j]; \
+                    if (!roe->valid) continue; \
+                    /* Block LOAD if older unready STORE exists */ \
+                    if (!roe->ready && (roe->ir.raw & 0x7f) == 0x23) \
+                        { blocked = 1; break; } \
+                    /* Block LOAD if older FENCE exists (sbuf not yet drained) */ \
+                    if (roe->ir.type == ITYPE_FENCE && ooo.sbuf_count > 0) \
+                        { blocked = 1; break; } \
                 } \
+                if (blocked) continue; \
             } \
             if (best == -1) { best = i; } else { \
                 da = (ooo.rs[i].rob_idx    - ooo.rob_head + ROB_SIZE) % ROB_SIZE; \
@@ -1223,6 +1225,8 @@ static void ooo_trace_cycle(void)
 static void ooo_drain_store_buf(void)
 {
     if (ooo.sbuf_count == 0) return;
+    if (ooo.sbuf_drain_tick > 0) { ooo.sbuf_drain_tick--; return; }
+    ooo.sbuf_drain_tick = LAT_L2_HIT - 1;  /* drain one entry every L2-hit cycles */
     StoreBufEntry *se = &ooo.sbuf[ooo.sbuf_head];
     vaddr_write(se->addr, se->width, se->data);
     se->valid = 0;

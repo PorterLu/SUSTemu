@@ -38,7 +38,7 @@ static volatile int *counter = (volatile int *)(MEM_BASE + 12);
 static volatile int *seq0  = (volatile int *)(MEM_BASE + 16);
 static volatile int *seq1  = (volatile int *)(MEM_BASE + 20);
 
-#define N_ITER 500
+#define N_ITER 2000
 
 static void uart_putchar(char c)
 {

@@ -166,6 +166,7 @@ typedef struct {
     int           sbuf_head;
     int           sbuf_tail;
     int           sbuf_count;
+    int           sbuf_drain_tick;  /* cycles remaining until next drain */
 } OOOState;
 
 /* ── Globals ──────────────────────────────────────────────────────────────── */
