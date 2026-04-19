@@ -31,6 +31,11 @@ order_lab/**/*.elf
 order_lab/**/*.o
 order_lab/**/*.d
 
+cache_lab/**/*.bin
+cache_lab/**/*.elf
+cache_lab/**/*.o
+cache_lab/**/*.d
+
 # perf profiling data
 perf.data
 perf.data.old
