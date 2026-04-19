@@ -2,6 +2,8 @@
 
 A RISC-V CPU simulator for computer architecture education, based on the RV64-IM ISA. Supports functional interpretation, in-order pipeline, out-of-order execution (Tomasulo + ROB), branch prediction, multi-core simulation, and a two-level cache hierarchy — suitable for architecture lab experiments and performance analysis.
 
+Compatible with [NJU AbstractMachine (AM)](https://github.com/NJU-ProjectN/abstract-machine) (`ARCH=riscv64-nemu`). Tested with Super Mario Bros. via [LiteNES](https://github.com/NJU-ProjectN/litenes).
+
 ## Features
 
 ### ISA Support
@@ -197,14 +199,7 @@ cd labs/cache_lab/Q2 && make run
 
 ---
 
-## Licenses
+## License
 
-| Component | License | Source |
-|-----------|---------|--------|
-| SUSTemu (this repository) | MIT | — |
-| [NEMU](https://github.com/NJU-ProjectN/nemu) | GPL-2.0 | Nanjing University; SUSTemu is architecturally inspired by NEMU |
-| [AbstractMachine (`am/`)](https://github.com/NJU-ProjectN/abstract-machine) | MIT | Nanjing University |
-| [LiteNES (`litenes/`)](https://github.com/NJU-ProjectN/litenes) | MIT | NJU-ProjectN |
-| [kconfiglib](https://github.com/ulfalizer/Kconfiglib) | ISC | Ulf Magnusson |
+Licensed under the [Mulan Permissive Software License, Version 2 (Mulan PSL v2)](http://license.coscl.org.cn/MulanPSL2).
 
-> SUSTemu is developed at SUSTech (Southern University of Science and Technology) for computer architecture coursework. It is not affiliated with or endorsed by Nanjing University.
