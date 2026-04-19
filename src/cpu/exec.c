@@ -66,17 +66,18 @@ static void exec_once()
 	g_sim_instret++;
 
 	/* ── Instruction trace (same format as before) ─────────────── */
-	sprintf(log_buf, "%016lx:    ", pc);
-	for (int i = 0; i < 4; i++)
-		sprintf(log_buf + 21 + 3 * i, "%02x ", *(((uint8_t *)&raw) + 3 - i));
-	sprintf(log_buf + 33, "   ");
-	disassemble(log_buf + 36, 70, pc, (uint8_t *)(&raw), 4);
+	if (g_print_step || log_fp) {
+		sprintf(log_buf, "%016lx:    ", pc);
+		for (int i = 0; i < 4; i++)
+			sprintf(log_buf + 21 + 3 * i, "%02x ", *(((uint8_t *)&raw) + 3 - i));
+		sprintf(log_buf + 33, "   ");
+		disassemble(log_buf + 36, 70, pc, (uint8_t *)(&raw), 4);
 
-	if (g_print_step)
-		printf("%s\n", log_buf);
-	log_write("%s\n", log_buf);
-
-	add_ringbuf_inst(log_buf);
+		if (g_print_step)
+			printf("%s\n", log_buf);
+		log_write("%s\n", log_buf);
+		add_ringbuf_inst(log_buf);
+	}
 
 	/*****************************vga更新***************************************
 	 * 每隔一段时间将vga屏幕上的信息进行更新                                         *
@@ -137,6 +138,12 @@ void exec(uint64_t n)
 			cores_initialised = 1;
 			for (int i = 0; i < g_num_cores; i++) {
 				Core *c = &cores[i];
+				/* Install this core's context before init so cache globals are valid */
+				g_current_hartid = c->core_id;
+				cpu   = c->cpu;
+				csr   = c->csr;
+				L1I_cache = c->l1i;
+				L1D_cache = c->l1d;
 				if (c->mode == CORE_MODE_INORDER)
 					pipeline_init_core(c);
 				else if (c->mode == CORE_MODE_OOO)

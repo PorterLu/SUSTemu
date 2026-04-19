@@ -122,7 +122,10 @@ else
   TASKSET =
 endif
 
-run-mario: all $(LITENES_BIN)
+run-mario-functional: all $(LITENES_BIN)
+	DISPLAY=:0 $(TASKSET) ./build/sustemu -b -e $(LITENES_ELF) $(LITENES_BIN)
+
+
 	DISPLAY=:0 $(TASKSET) ./build/sustemu --ooo --bpred -b -e $(LITENES_ELF) $(LITENES_BIN)
 
 run-mario-inorder: all $(LITENES_BIN)
