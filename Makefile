@@ -1,4 +1,4 @@
-.PHONY: all run clean menuconfig bench bench-functional bench-inorder bench-bpred bench-ooo bench-dhrystone bench-dual run-mario run-mario-difftest
+.PHONY: all run clean menuconfig bench bench-functional bench-inorder bench-bpred bench-ooo bench-dhrystone bench-dual run-mario run-mario-functional run-mario-inorder run-mario-difftest
 
 PWD = $(shell pwd)
 OBJ_DIR = $(PWD)/build
@@ -125,7 +125,7 @@ endif
 run-mario-functional: all $(LITENES_BIN)
 	DISPLAY=:0 $(TASKSET) ./build/sustemu -b -e $(LITENES_ELF) $(LITENES_BIN)
 
-
+run-mario: all $(LITENES_BIN)
 	DISPLAY=:0 $(TASKSET) ./build/sustemu --ooo --bpred -b -e $(LITENES_ELF) $(LITENES_BIN)
 
 run-mario-inorder: all $(LITENES_BIN)
