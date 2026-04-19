@@ -1,178 +1,127 @@
-# Memory Ordering Lab
+<style>
+    table {
+        width: 100%;
+    }
+</style>
 
-## Overview
+# Lab 8: Memory Ordering Lab
 
-本 lab 通过在真实 OOO 双核模拟器上运行三个实验，**定量**观察 TSO（Total Store Order）内存模型带来的并发问题，并学习如何用 `fence` 指令修复它们。
+In this lab, you will use the SUSTemu RISC-V simulator to observe how the TSO (Total Store Order) memory model causes observable concurrency bugs in dual-core programs, and how `fence` instructions restore the ordering guarantees needed for correct synchronization. By the end of this lab, you will be able to:
 
-模拟器实现了 **TSO 内存模型**：每个核有一个 store buffer，committed store 先进入 store buffer，延迟一个周期才写入共享 cache。这与真实 x86/ARMv8 处理器的行为一致。
+1. Demonstrate a Store-Load reordering violation using the classic Dekker litmus test
+2. Explain how a per-core store buffer causes lost updates in a non-atomic counter
+3. Identify why Peterson's mutex fails under TSO and add the minimal fences to fix it
 
----
+**Default simulator configuration:**
+- Two OOO cores: `--dual --ooo --bpred -b`
+- Each core has a per-core store buffer (`STORE_BUF_SIZE = 16`); committed stores drain one entry per cycle to the shared L2 cache
+- TSO model: `LOAD` can pass an older `STORE` to a different address (Store-Load reordering); Store-Store order is preserved
+- Shared memory region: `MEM_BASE = 0x80200000`; MMIO UART at `0xa00003f8`
 
-## 背景知识
+Each benchmark directory provides two make targets:
 
-### Sequential Consistency (SC) vs TSO
-
-| 属性 | SC | TSO |
-|------|----|-----|
-| Store 全局可见时机 | commit 时立即 | commit 后延迟（store buffer） |
-| Load 可以越过 Store | 否 | 是（同一核） |
-| Store-Store 重排 | 否 | 否 |
-| `fence` 作用 | 无需 | 排空 store buffer |
-
-在 TSO 下，每个核执行：
-```
-STORE x = 1          → 进入 store buffer（其他核看不见）
-LOAD  r1 = y         → 从 cache 读，看不到其他核 store buffer 中的内容
-```
-这导致两个核同时看到对方的"旧值"，产生 **TSO violation**。
-
-### `fence rw, rw` 指令
-
-RISC-V 的 `fence rw, rw` 是一个 serializing 指令：
-- 排空当前核的 store buffer（所有 pending store 写入 cache）
-- 确保 fence 之前的 load/store 对其他核全局可见
-- fence 之后的操作保证在此之后才执行
-
----
-
-## Q1：Store-Load 重排（Litmus Test）
-
-**目录**：`order_lab/Q1/litmus/`
-
-**实验设计**：经典 Dekker litmus test
-
-```
-初始：x = 0, y = 0
-
-Core 0:          Core 1:
-  x = 1;           y = 1;
-  r1 = y;          r2 = x;
-```
-
-在 SC 下：至少有一个 store 先于对方的 load 完成，所以 r1=0 && r2=0 **不可能**同时出现。
-
-在 TSO 下：两个 store 都可能停在各自的 store buffer 里，两个 load 都从 cache 读到 0，导致 r1=0 && r2=0 **有可能**同时出现（violation）。
-
-**运行**：
 ```bash
-cd order_lab/Q1/litmus
-make
-make run          # 不加 fence，观察 violation
-make run-fence    # 加 fence，验证修复
+make run        # run without fence between store and load
+make run-fence  # run with fence rw,rw inserted
 ```
 
-### Question 1
+> **Note:** after modifying any file under `include/`, always run `make clean && make` from the repository root before running lab benchmarks.
 
-运行 `make run`（不加 fence），记录输出的 Violations 次数和百分比。
+<div style="page-break-after: always;"></div>
 
-> 思考：为什么在顺序执行（in-order）模型下不会出现 violation？OOO + TSO 的哪个特性使 violation 成为可能？
+# Step 1 — Store-Load Reordering
 
-### Question 2
+## Background
 
-运行 `make run-fence`（加 `fence rw, rw`）。解释为什么加 fence 后 r1=0 && r2=0 消失。
+`order_lab/Q1/` contains a classic **Dekker litmus test**. Two cores execute the following sequence in parallel for 200 trials:
 
-> 提示：fence 如何改变 store 的全局可见时机？画出加/不加 fence 时两个核的执行时序图。
+```
+Initially:  x = 0,  y = 0
 
----
+Core 0:  x = 1;  [fence?]  r1 = y
+Core 1:  y = 1;  [fence?]  r2 = x
+```
 
-## Q2：非原子计数器（Lost Updates）
+Under **Sequential Consistency (SC)**: at least one store must be globally visible before the other core's load, so the outcome `r1 = 0 AND r2 = 0` is **impossible**.
 
-**目录**：`order_lab/Q2/counter/`
+Under **TSO**: both stores can sit in each core's store buffer while both loads read stale values from the shared cache. The outcome `r1 = 0 AND r2 = 0` is **observable** — this is a TSO violation.
 
-**实验设计**：两个核各自对共享计数器执行 1000 次自增。
+A **rendezvous barrier** (using monotonic sequence numbers and `fence rw,rw`) synchronizes the two cores between trials so that each trial starts from a clean state. The barrier itself is unrelated to the litmus sequence being tested.
 
-每次自增操作：
+```bash
+cd order_lab/Q1
+make run        # no fence between store and load
+make run-fence  # fence rw,rw between store and load
+```
+
+**Question 1:** Run `make run`. Record the number and percentage of violations from the output. Then run with `make run-inorder` (edit `FLAGS` in the Makefile to use `--inorder --bpred -b` instead of `--ooo`). Explain why the in-order pipeline produces zero violations, and which property of the OOO + TSO combination makes violations possible.
+
+**Question 2:** Run `make run-fence`. Explain why inserting `fence rw,rw` between the store and the load eliminates the `r1 = 0 AND r2 = 0` outcome. Draw a timeline showing the happens-before relationship established by the fence for both cores.
+
+<div style="page-break-after: always;"></div>
+
+# Step 2 — Lost Updates
+
+## Background
+
+`order_lab/Q2/` contains two cores each performing 1000 increments of a shared counter. Each increment is a non-atomic **read-modify-write** sequence:
+
 ```c
-tmp = *counter;   // LOAD
+tmp = *counter;   // LOAD  → may read from shared cache, missing the other core's store buffer
 tmp = tmp + 1;
-*counter = tmp;   // STORE（进入 store buffer）
+*counter = tmp;   // STORE → enters this core's store buffer
 ```
 
-这是一个**读-改-写**序列，不是原子操作。在 TSO 下：
-- Core 0 的 STORE（`counter=k+1`）停在 store buffer 里
-- Core 1 的 LOAD 读到 cache 中的旧值 `k`
-- 两核都写入 `k+1`，一次更新丢失
+Because the store enters the store buffer and is not immediately visible to the other core, both cores can read the same value `k`, both compute `k+1`, and both write `k+1` back — one increment is lost. With 2 × 1000 iterations and a fully-loaded store buffer, nearly every increment can be a lost update.
 
-**运行**：
 ```bash
-cd order_lab/Q2/counter
+cd order_lab/Q2
 make run
 ```
 
-### Question 3
+**Question 3:** Run `make run`. Record the actual counter value and the expected value (2000). Calculate the number of lost updates. Explain why the loss count is close to `N_ITER` (1000) rather than a small fraction, using the store buffer drain latency to support your argument.
 
-运行实验，记录实际 counter 值和期望值（2000）。计算丢失的更新次数。
+<div style="page-break-after: always;"></div>
 
-> 思考：为什么丢失的更新接近 N_ITER（1000）次？store buffer 的存在如何导致 Core 1 总是读到 Core 0 的旧值？
+# Step 3 — Peterson Mutual Exclusion Lock
 
----
+## Background
 
-## Q3：Peterson 互斥锁（TSO 下的锁失效）
-
-**目录**：`order_lab/Q3/peterson/`
-
-**实验设计**：Peterson 算法是一个经典的纯软件互斥锁，不需要原子指令：
+`order_lab/Q3/` implements **Peterson's algorithm** — a classic software mutex that requires no atomic instructions and is provably correct under SC:
 
 ```c
 lock(i):
-    want[i] = 1;          // "我想进入临界区"
-    turn    = 1 - i;      // "你先"
-    while (want[1-i] && turn == 1-i) {}   // 等待
+    want[i] = 1;       // "I want to enter the critical section"
+    turn    = 1 - i;   // "You go first"
+    while (want[1-i] && turn == 1-i) {}  // spin-wait
 
 unlock(i):
     want[i] = 0;
 ```
 
-在 SC 下，这个算法可以**证明**是正确的（互斥性 + 无死锁）。
+Under TSO, `want[i] = 1` enters the store buffer and is **not immediately visible** to the other core. Both cores may observe `want[j] == 0` (stale cache value) and enter the critical section simultaneously — the mutex fails.
 
-在 TSO 下，没有 fence 时算法**失效**：
-- `want[i]=1` 停在 store buffer，其他核看到的仍是 0
-- 两个核都认为对方不想进入，同时进入临界区
-- 临界区内的 counter++ 不受保护，产生丢失更新
-
-**代码骨架**（`peterson.c`）：
+The fix is to add `fence rw,rw` after `want[i] = 1` (to drain the store buffer before reading `want[j]`) and after `turn = 1-i` (to prevent the turn store from being reordered past the load of `want[j]`). The `peterson.c` source contains two `TODO` markers indicating where the fences belong:
 
 ```c
 static void lock(int i) {
     int j = 1 - i;
     want[i] = 1;
-    /* TODO (Q4): 在此添加 fence rw,rw */
+    /* TODO (Q5): add fence rw,rw here */
     *turn = j;
-    /* TODO (Q4): 在此添加 fence rw,rw */
+    /* TODO (Q5): add fence rw,rw here */
     while (want[j] && *turn == j) {}
 }
 ```
 
-**运行**：
+Both cores protect a shared counter with this lock, each incrementing it `N_ITER` times. The expected result is `2 * N_ITER` if the mutex is correct.
+
 ```bash
-cd order_lab/Q3/peterson
-make
-make run          # 不加 fence：锁失效，counter 错误
-make run-fence    # 加 fence：锁正确，counter = 2*N_ITER
+cd order_lab/Q3
+make run        # USE_FENCE=0: lock is broken under TSO
+make run-fence  # USE_FENCE=1: lock is correct
 ```
 
-### Question 4
+**Question 4:** Run `make run` (`USE_FENCE=0`). Record the actual counter value versus the expected value. Explain which step of `lock()` fails under TSO. Draw a timeline showing how both cores simultaneously pass the spin-wait and enter the critical section.
 
-运行 `make run`（`USE_FENCE=0`）。观察实际 counter 值与期望值（1000）的差距。
-
-> 解释：在 TSO 下，`lock()` 的哪一步失效了？画出两个核同时进入临界区的执行时序。
-
-### Question 5
-
-在 `peterson.c` 的 `lock()` 函数中，找到两处 `TODO` 注释，分别在 `want[i]=1` 之后和 `*turn=j` 之后添加 `fence rw, rw`。
-
-运行 `make run-fence` 验证 counter = 1000（所有更新不丢失）。
-
-> 解释：为什么需要**两个** fence？只加一个 fence 够吗？分别说明每个 fence 防止了什么重排序。
-
----
-
-## 总结
-
-| 实验 | 问题 | 根因 | 修复 |
-|------|------|------|------|
-| Q1 Litmus | r1=0 && r2=0 | store 延迟对其他核可见 | store 后加 fence |
-| Q2 Counter | lost updates | LOAD 读到 store buffer 中的旧值 | 需要原子 RMW 或锁 |
-| Q3 Peterson | 锁失效 | want[] 写不立即全局可见 | lock() 中加 fence |
-
-**核心结论**：TSO 的 store buffer 使得多核程序在没有正确同步的情况下产生不确定行为。`fence` 指令通过强制排空 store buffer 来恢复必要的内存顺序保证。
+**Question 5:** Open `order_lab/Q3/peterson.c`, find the two `TODO` comments inside `lock()`, and add `__asm__ volatile("fence rw, rw")` at each location. Run `make run-fence` to verify the counter equals `N_ITER` (all updates preserved). Explain why **two** fences are required — what memory reordering does each one prevent, and why a single fence is insufficient.
