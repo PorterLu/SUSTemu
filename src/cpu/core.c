@@ -60,6 +60,9 @@ void core_create(int core_id, CoreMode mode, int bpred_enabled)
 
     if (bpred_enabled)
         bpred_init(&c->bpred);
+
+    if (mode == CORE_MODE_INORDER)
+        pipeline_init_core(c);
 }
 
 /* ── exec_once_core ──────────────────────────────────────────────────────── */

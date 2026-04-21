@@ -502,7 +502,13 @@ void pipeline_init_core(Core *c)
     PipeStats save_stats = pipe_stats;
 
     cpu_pipe       = c->cpu_pipe;
-    pipeline_fix_ptrs(&cpu_pipe, &c->cpu_pipe);
+    /* Always (re)initialize slot pointers from the copied slots array.
+     * pipeline_fix_ptrs cannot recover NULL pointers in a freshly-zeroed
+     * core, so we set them directly as pipeline_init() does. */
+    cpu_pipe.id  = &cpu_pipe.slots[0];
+    cpu_pipe.ex  = &cpu_pipe.slots[1];
+    cpu_pipe.mem = &cpu_pipe.slots[2];
+    cpu_pipe.wb  = &cpu_pipe.slots[3];
     pipe_stats = c->pipe_stats;
 
     /* Init latches and fetch_pc */
