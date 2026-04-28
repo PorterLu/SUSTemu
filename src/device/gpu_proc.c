@@ -15,6 +15,7 @@
 #include <gpu.h>
 #include <SDL2/SDL.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <semaphore.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -37,13 +38,24 @@ static volatile uint32_t *g_running     = NULL;
 /* ── init_sdl ─────────────────────────────────────────────────────────── */
 static void init_sdl(void)
 {
-    SDL_Init(SDL_INIT_VIDEO);
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        fprintf(stderr, "GPU: SDL_Init failed: %s\n", SDL_GetError());
+        _exit(1);
+    }
     SDL_Window *window = NULL;
-    SDL_CreateWindowAndRenderer(SCREEN_W * 2, SCREEN_H * 2, 0,
-                                &window, &renderer);
+    if (SDL_CreateWindowAndRenderer(SCREEN_W * 2, SCREEN_H * 2,
+                                    SDL_WINDOW_SHOWN,
+                                    &window, &renderer) != 0) {
+        fprintf(stderr, "GPU: SDL_CreateWindowAndRenderer failed: %s\n", SDL_GetError());
+        _exit(1);
+    }
     SDL_SetWindowTitle(window, "SUSTemu (GPU)");
     texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
                                 SDL_TEXTUREACCESS_STATIC, SCREEN_W, SCREEN_H);
+    if (!texture) {
+        fprintf(stderr, "GPU: SDL_CreateTexture failed: %s\n", SDL_GetError());
+        _exit(1);
+    }
 }
 
 /* ── send_key_event ───────────────────────────────────────────────────── */

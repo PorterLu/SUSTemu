@@ -75,6 +75,11 @@ void init_vga(void)
     vgactl[1] = 0;
     add_mmio_map("vgactl", CONFIG_VGA_CTL_MMIO, vgactl, 8, NULL);
 
+    /* GPU child process (Linux only — macOS fork() breaks Cocoa/SDL).
+     * On macOS we use the traditional in-process rendering path. */
+#ifdef __APPLE__
+    goto fallback;
+#else
     /* Allocate framebuffer via shared memory for zero-copy GPU access */
     shm_fd = shm_open("/sustemu_gpu_fb", O_CREAT | O_RDWR, 0600);
     if (shm_fd < 0) goto fallback;
@@ -104,12 +109,10 @@ void init_vga(void)
     /* Create keyboard pipe */
     if (pipe(kbd_pipe) < 0) { sem_close(frame_sem); sem_unlink("/sustemu_gpu_sem"); munmap(vmem_ptr, FB_SIZE + 16); close(shm_fd); goto fallback; }
 
-    /* Fork GPU child process */
     g_gpu_pid = fork();
     if (g_gpu_pid == 0) {
         /* Child */
-        close(kbd_pipe[0]);            /* close read end */
-        close(0); close(1); close(2);  /* detach from terminal */
+        close(kbd_pipe[0]);            /* close read end of keyboard pipe */
         gpu_proc_main(shm_fd, kbd_pipe[1]);
         /* never returns */
     }
@@ -130,9 +133,10 @@ void init_vga(void)
     /* Clear framebuffer */
     memset(vmem_ptr, 0, FB_SIZE);
     return;
+#endif /* !__APPLE__ */
 
 fallback:
-    /* Direct (in-process) rendering fallback */
+    /* Direct (in-process) rendering */
     g_gpu_pid = 0;
     g_kbd_fd = -1;
     vmem_ptr = new_space(FB_SIZE);
@@ -163,24 +167,41 @@ void vga_update_screen(void)
  */
 void gpu_kbd_poll(void)
 {
-    if (g_kbd_fd < 0) return;
+    if (g_gpu_pid > 0) {
+        /* GPU process path: read keyboard events from pipe */
+        if (g_kbd_fd < 0) return;
+        uint8_t buf[2];
+        while (1) {
+            ssize_t n = read(g_kbd_fd, buf, sizeof(buf));
+            if (n < (ssize_t)sizeof(buf)) break;
 
-    uint8_t buf[2];
-    while (1) {
-        ssize_t n = read(g_kbd_fd, buf, sizeof(buf));
-        if (n < (ssize_t)sizeof(buf)) break;  /* no more data or error */
+            uint8_t scancode  = buf[0];
+            int     is_down   = buf[1];
 
-        uint8_t scancode  = buf[0];
-        int     is_down   = buf[1];
+            if (scancode == 0xFF) {
+                extern int state;
+                state = 4;  /* NEMU_QUIT */
+                continue;
+            }
 
-        if (scancode == 0xFF) {
-            /* SDL_QUIT forwarded from GPU process */
-            extern int state;
-            state = 4;  /* NEMU_QUIT */
-            continue;
+            extern void send_key(uint8_t, bool);
+            send_key(scancode, (bool)is_down);
         }
-
-        extern void send_key(uint8_t, bool);
-        send_key(scancode, (bool)is_down);
+    } else {
+        /* In-process path: poll SDL events directly */
+        extern int state;
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            switch (ev.type) {
+            case SDL_QUIT: state = 4; break;  /* NEMU_QUIT */
+            case SDL_KEYDOWN:
+            case SDL_KEYUP: {
+                extern void send_key(uint8_t, bool);
+                send_key(ev.key.keysym.scancode,
+                         ev.key.type == SDL_KEYDOWN);
+                break;
+            }
+            }
+        }
     }
 }
