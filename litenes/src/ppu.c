@@ -128,6 +128,7 @@ void ppu_ram_write(word address, byte data) {
 // Rendering
 
 void ppu_draw_background_scanline(bool mirror) {
+  if (!g_draw_this_frame) return;
   int tile_x;
   for (tile_x = ppu_shows_background_in_leftmost_8px() ? 0 : 1; tile_x < 32; tile_x ++) {
     // Skipping off-screen pixels

@@ -8,6 +8,10 @@
 #define SCR_H       240
 #define FRAME_SKIP    1
 
+/* Per-frame flag: true when the PPU should render to canvas.
+ * Set once at frame start; checked by draw() and background scanlines. */
+extern bool g_draw_this_frame;
+
 void fce_update_screen();
 int fce_load_rom(char *rom);
 void fce_init();

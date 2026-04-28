@@ -6,12 +6,16 @@
 #include <klib.h>
 
 static int frame_cnt;
-static inline bool candraw() { return frame_cnt % (1 + FRAME_SKIP) == 0; }
+bool g_draw_this_frame;
+
+/* FRAME_SKIP=1 → render every other frame → (frame_cnt & 1) == 0.
+ * Bitwise AND avoids the expensive modulo operation. */
+static inline bool candraw(void) { return (frame_cnt & 1) == 0; }
 
 static uint32_t canvas[SCR_W * SCR_H];
 
 void draw(int x, int y, int idx) {
-  if (x >= 0 && x < SCR_W && y >= 0 && y < SCR_H && candraw()) {
+  if (g_draw_this_frame && x >= 0 && x < SCR_W && y >= 0 && y < SCR_H) {
     canvas[y * SCR_W + x] = palette[idx];
   }
 }
@@ -104,8 +108,11 @@ void fce_run() {
   uint32_t last = gtime;
   while(1) {
     wait_for_frame();
-    int scanlines = 262;
+    /* Per-frame draw decision: computed once instead of per-pixel */
+    frame_cnt++;
+    g_draw_this_frame = candraw();
 
+    int scanlines = 262;
     while (scanlines-- > 0) {
       ppu_cycle();
       psg_detect_key();
@@ -123,8 +130,7 @@ void fce_run() {
 }
 
 void fce_update_screen() {
-  frame_cnt++;
-  if (!candraw()) return;
+  if (!g_draw_this_frame) return;
 
   int idx = ppu_ram_read(0x3F00);
   uint32_t bgc = palette[idx];
@@ -136,5 +142,10 @@ void fce_update_screen() {
 
   io_write(AM_GPU_FBDRAW, xpad, ypad, canvas, SCR_W, SCR_H, true);
 
-  for (int i = 0; i < SCR_W * SCR_H; i ++) canvas[i] = bgc;
+  /* Clear canvas with background colour for the next frame.
+   * Every pixel is redrawn each frame by the PPU, so clearing is only
+   * needed for pixels the PPU skips (transparent background pixels
+   * that might have stale data from a previous non-draw frame). */
+  for (int i = 0; i < SCR_W * SCR_H; i++)
+    canvas[i] = bgc;
 }
