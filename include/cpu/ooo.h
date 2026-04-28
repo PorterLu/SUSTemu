@@ -135,6 +135,7 @@ typedef struct {
     RSEntry  rs[RS_SIZE];
     int      unready_store_count; /* # of STOREs in ROB with ready=0; maintained
                                    * incrementally to avoid O(ROB) scan per LOAD */
+    int      rob_store_count;     /* total # of STORE instructions in ROB       */
     /* Per-EU-type bitmask of RS slots that are valid AND have both sources ready.
      * Bit i set ↔ rs[i].valid && src1_ready && src2_ready && eu_type == EU_x.
      * Maintained by CDB broadcast, issue, flush, and rename. Lets IS stage

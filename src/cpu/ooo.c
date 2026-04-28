@@ -293,9 +293,11 @@ static void ooo_flush_after(int branch_rob_idx)
                 ooo.prf[entry->phys_rd].ready = 0;
                 freelist_push(entry->phys_rd);
             }
-            /* Maintain unready_store_count */
-            if (!entry->ready && (entry->ir.raw & 0x7fu) == 0x23u)
-                ooo.unready_store_count--;
+            /* Maintain store counters */
+            if ((entry->ir.raw & 0x7fu) == 0x23u) {
+                if (!entry->ready) ooo.unready_store_count--;
+                ooo.rob_store_count--;
+            }
             entry->valid = 0;
             ooo.rob_count--;
         }
@@ -454,6 +456,7 @@ static void ooo_stage_commit(void)
                 /* MMIO / non-cacheable: immediate write, no buffering */
                 vaddr_write(rob->ir.mem_addr, rob->ir.mem_width, rob->store_data);
             }
+            ooo.rob_store_count--;
         }
 
         /* Update architectural register file and committed RAT */
@@ -827,7 +830,10 @@ lsu_do_fill:
     } \
 } while (0)
 
-            {
+            /* STLF fast path: skip scan when no store has data ready to forward.
+             * sbuf holds committed stores; ROB stores forward only when ready.
+             * rob_store_count - unready_store_count = # of ready stores in ROB. */
+            if (ooo.sbuf_count > 0 || ooo.rob_store_count > ooo.unready_store_count) {
                 /* sbuf scan: newest matching entry wins (scan oldest→newest,
                  * last hit overwrites — most-recently-enqueued entry wins). */
                 for (int bi = 0; bi < ooo.sbuf_count; bi++) {
@@ -838,8 +844,6 @@ lsu_do_fill:
                               ir->mem_addr, ir->mem_width, ir->mem_sign,
                               ir->result);
                 }
-            }
-            {
                 /* ROB scan: most-recent ready STORE wins. */
                 int scan = ooo.rob_head;
                 while (scan != rob_idx) {
@@ -981,8 +985,10 @@ static void ooo_stage_rn(void)
         rob->store_data = 0;
 
         /* Track unready stores for fast IS-stage memory-ordering check */
-        if ((ir->raw & 0x7fu) == 0x23u)
+        if ((ir->raw & 0x7fu) == 0x23u) {
             ooo.unready_store_count++;
+            ooo.rob_store_count++;
+        }
 
         /*
          * ── Read source register mappings BEFORE renaming the destination ─────
