@@ -114,7 +114,7 @@ LITENES_BIN = $(LITENES_DIR)/build/litenes-riscv64-nemu.bin
 
 $(LITENES_ELF): $(LITENES_BIN)
 $(LITENES_BIN):
-	AM_HOME=$(AM_HOME) make -C $(LITENES_DIR) ARCH=riscv64-nemu
+	AM_HOME=$(AM_HOME) CROSS_COMPILE=riscv64-unknown-elf- make -C $(LITENES_DIR) ARCH=riscv64-nemu
 
 ifeq ($(UNAME_S),Linux)
   TASKSET = taskset -c 0
