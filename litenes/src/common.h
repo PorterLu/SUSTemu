@@ -9,25 +9,25 @@ typedef uint8_t byte;
 typedef uint16_t word;
 typedef uint32_t dword;
 
-// Binary Operations
-bool common_bit_set(long long value, byte position);
+/* Inline bit operations — expanded directly in callers, no function-call
+ * overhead on the simulated RISC-V CPU.  Also retained as out-of-line
+ * functions in common.c for compatibility with function-pointer users. */
+static inline bool common_bit_set(long long value, byte position) {
+    return value & (1L << position);
+}
 
-// Byte Bit Operations
-void common_set_bitb(byte *variable, byte position);
-void common_unset_bitb(byte *variable, byte position);
-void common_toggle_bitb(byte *variable, byte position);
-void common_modify_bitb(byte *variable, byte position, bool set);
+#define _COMMON_BITOPS(SUFFIX, TYPE) \
+    static inline void common_set_bit##SUFFIX(TYPE *v, byte p)    { *v |= (TYPE)(1L << p); } \
+    static inline void common_unset_bit##SUFFIX(TYPE *v, byte p)  { *v &= (TYPE)(~(1L << p)); } \
+    static inline void common_toggle_bit##SUFFIX(TYPE *v, byte p) { *v ^= (TYPE)(1L << p); } \
+    static inline void common_modify_bit##SUFFIX(TYPE *v, byte p, bool set) { \
+        set ? common_set_bit##SUFFIX(v, p) : common_unset_bit##SUFFIX(v, p); \
+    }
 
-// Word Bit Operations
-void common_set_bitw(word *variable, byte position);
-void common_unset_bitw(word *variable, byte position);
-void common_toggle_bitw(word *variable, byte position);
-void common_modify_bitw(word *variable, byte position, bool set);
+_COMMON_BITOPS(b, byte)
+_COMMON_BITOPS(w, word)
+_COMMON_BITOPS(d, dword)
 
-// Double Word Bit Operations
-void common_set_bitd(dword *variable, byte position);
-void common_unset_bitd(dword *variable, byte position);
-void common_toggle_bitd(dword *variable, byte position);
-void common_modify_bitd(dword *variable, byte position, bool set);
+#undef _COMMON_BITOPS
 
 #endif
