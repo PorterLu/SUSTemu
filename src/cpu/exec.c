@@ -9,7 +9,6 @@
 #include <elftl.h>
 #include <gpu.h>
 #include <timer.h>
-#include <SDL2/SDL.h>
 #include <keyboard.h>
 #include <ringbuf.h>
 #include <pmem.h>
@@ -90,23 +89,7 @@ static void exec_once()
 	 * 用于将事件全部放入到一个环形队列中                                              *
 	 **************************************************************************/
 #ifdef CONFIG_keyboard
-	SDL_Event event;
-	while (SDL_PollEvent(&event)) {
-		switch (event.type) {
-		case SDL_QUIT:
-			state = NEMU_QUIT;
-			break;
-		case SDL_KEYDOWN:
-		case SDL_KEYUP: {
-			uint8_t k = event.key.keysym.scancode;
-			bool is_keydown = (event.key.type == SDL_KEYDOWN);
-			send_key(k, is_keydown);
-			break;
-		}
-		default:
-			break;
-		}
-	}
+	gpu_kbd_poll();
 #endif
 }
 
@@ -173,19 +156,7 @@ void exec(uint64_t n)
 					vga_update_screen();
 #endif
 #ifdef CONFIG_keyboard
-					SDL_Event event;
-					while (SDL_PollEvent(&event)) {
-						switch (event.type) {
-						case SDL_QUIT: state = NEMU_QUIT; break;
-						case SDL_KEYDOWN:
-						case SDL_KEYUP: {
-							uint8_t k = event.key.keysym.scancode;
-							send_key(k, event.key.type == SDL_KEYDOWN);
-							break;
-						}
-						default: break;
-						}
-					}
+					gpu_kbd_poll();
 #endif
 				}
 			}
@@ -210,19 +181,7 @@ void exec(uint64_t n)
 					vga_update_screen();
 #endif
 #ifdef CONFIG_keyboard
-					SDL_Event event;
-					while (SDL_PollEvent(&event)) {
-						switch (event.type) {
-						case SDL_QUIT: state = NEMU_QUIT; break;
-						case SDL_KEYDOWN:
-						case SDL_KEYUP: {
-							uint8_t k = event.key.keysym.scancode;
-							send_key(k, event.key.type == SDL_KEYDOWN);
-							break;
-						}
-						default: break;
-						}
-					}
+					gpu_kbd_poll();
 #endif
 				}
 			}
