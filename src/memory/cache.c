@@ -197,6 +197,29 @@ void cache_prefetch(Cache *l1, Cache *l2, paddr_t miss_addr) {
 }
 
 
+/* Inline helpers: dispatch on len so the compiler emits a single load/store
+ * per case instead of calling platform memmove for variable-length copies. */
+static inline word_t cl_read(uint8_t *data, uint32_t offset, int len) {
+    word_t res = 0;
+    switch (len) {
+    case 8: memcpy(&res, data + offset, 8); break;
+    case 4: memcpy(&res, data + offset, 4); break;
+    case 2: memcpy(&res, data + offset, 2); break;
+    case 1: memcpy(&res, data + offset, 1); break;
+    default: memcpy(&res, data + offset, len); break;
+    }
+    return res;
+}
+static inline void cl_write(uint8_t *data, uint32_t offset, int len, word_t val) {
+    switch (len) {
+    case 8: memcpy(data + offset, &val, 8); break;
+    case 4: memcpy(data + offset, &val, 4); break;
+    case 2: memcpy(data + offset, &val, 2); break;
+    case 1: memcpy(data + offset, &val, 1); break;
+    default: memcpy(data + offset, &val, len); break;
+    }
+}
+
 word_t cache_read(Cache *l1, Cache *l2, paddr_t addr, int len) {
     int hit;
     CacheLine *line = find_line(l1, addr, &hit);
@@ -204,11 +227,7 @@ word_t cache_read(Cache *l1, Cache *l2, paddr_t addr, int len) {
         fetch_block(l1, l2, addr, line);
         cache_prefetch(l1, l2, addr);
     }
-
-    word_t res = 0;
-    uint32_t offset = addr & (BLOCK_SIZE - 1);
-    memcpy(&res, line->data + offset, len);
-    return res;
+    return cl_read(line->data, addr & (BLOCK_SIZE - 1), len);
 }
 
 /* cache_read_level — like cache_read() but returns the cache level that
@@ -229,10 +248,7 @@ int cache_read_level(Cache *l1, Cache *l2, paddr_t addr, int len, word_t *out_va
     } else {
         level = 0;
     }
-    word_t res = 0;
-    uint32_t offset = addr & (BLOCK_SIZE - 1);
-    memcpy(&res, line->data + offset, len);
-    *out_val = res;
+    *out_val = cl_read(line->data, addr & (BLOCK_SIZE - 1), len);
     return level;
 }
 
@@ -261,10 +277,7 @@ word_t cache_fill_and_read(Cache *l1, Cache *l2, paddr_t addr, int len)
         fetch_block(l1, l2, addr, line);
         cache_prefetch(l1, l2, addr);
     }
-    word_t res = 0;
-    uint32_t offset = addr & (BLOCK_SIZE - 1);
-    memcpy(&res, line->data + offset, len);
-    return res;
+    return cl_read(line->data, addr & (BLOCK_SIZE - 1), len);
 }
 
 int cache_probe_and_read_l1(Cache *l1, Cache *l2, paddr_t addr, int len, word_t *out_val)
@@ -278,8 +291,7 @@ int cache_probe_and_read_l1(Cache *l1, Cache *l2, paddr_t addr, int len, word_t 
         l1->hits++;
         line->last_access = l1->timer;
 
-        uint32_t offset = addr & (BLOCK_SIZE - 1);
-        memcpy(out_val, line->data + offset, len);
+        *out_val = cl_read(line->data, addr & (BLOCK_SIZE - 1), len);
         return 0;
     }
     /* L1 miss: probe L2 quietly, no L1 stats touched (fill happens later) */
@@ -296,9 +308,8 @@ void cache_write(Cache *l1, Cache *l2, paddr_t addr, int len, word_t data) {
         cache_prefetch(l1, l2, addr);
     }
 
-    uint32_t offset = addr & (BLOCK_SIZE - 1);
-    memcpy(line->data + offset, &data, len);
-    line->dirty = 1; // 写操作标记脏位
+    cl_write(line->data, addr & (BLOCK_SIZE - 1), len, data);
+    line->dirty = 1; /* 写操作标记脏位 */
 }
 
 // 打印报告
