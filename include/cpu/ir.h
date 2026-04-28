@@ -99,7 +99,7 @@ typedef struct IR_Inst {
  * ir_writeback — commit ir->result to cpu->gpr[ir->rd] (if rd != -1),
  *                then enforce cpu->gpr[0] == 0.
  */
-void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir);
+inline void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir);
 void ir_execute(IR_Inst *ir, CPU_state *cpu);
 void ir_mem_access(IR_Inst *ir, int *out_lat);
 void ir_writeback(IR_Inst *ir, CPU_state *cpu);
