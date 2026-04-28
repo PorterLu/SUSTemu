@@ -173,7 +173,7 @@ void exec(uint64_t n)
 #ifdef CONFIG_timer
 			static uint64_t ooo_last = 0;
 			static uint64_t ooo_cycle_ctr = 0;
-			if ((++ooo_cycle_ctr & 4095) == 0) {
+			if ((++ooo_cycle_ctr & 16383) == 0) {
 				uint64_t ooo_now = get_time();
 				if ((ooo_now - ooo_last) >= 1000000 / 60) {
 					ooo_last = ooo_now;
@@ -210,7 +210,7 @@ void exec(uint64_t n)
 #ifdef CONFIG_timer
 			static uint64_t pip_last = 0;
 			static uint64_t pip_cycle_ctr = 0;
-			if ((++pip_cycle_ctr & 4095) == 0) {
+			if ((++pip_cycle_ctr & 16383) == 0) {
 				uint64_t pip_now = get_time();
 				if ((pip_now - pip_last) >= 1000000 / 60) {
 					pip_last = pip_now;
