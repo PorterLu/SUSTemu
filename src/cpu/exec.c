@@ -26,19 +26,6 @@ int g_bpred_mode   = 0;   /* set to 1 by --bpred command-line flag   */
 extern void halt();
 char log_buf[128];
 
-/*
- * exec_once — fetch, decode (IR), execute, writeback one instruction.
- *
- * This replaces the old single-pass decode_exec() approach with the
- * three-step IR pipeline introduced in Phase 1:
- *
- *   1. ir_decode    — pattern-match raw bits → IR_Inst (operands + exec_fn)
- *   2. ir_execute   — call exec_fn → compute result / dnpc / side-effects
- *   3. ir_writeback — commit result to GPR file
- *
- * The global `s` (Decode) struct is kept up-to-date so that the SDB
- * monitor and disassembler continue to work without changes.
- */
 static void exec_once()
 {
 	vaddr_t pc   = cpu.pc;
@@ -84,10 +71,15 @@ static void exec_once()
 	 **************************************************************************/
 #ifdef CONFIG_timer
 	static uint64_t last = 0;
-	uint64_t now = get_time();
-	if ((now - last) < 1000000 / 60)
+	static uint64_t func_ctr = 0;
+	if ((++func_ctr & 16383) == 0) {
+		uint64_t now = get_time();
+		if ((now - last) < 1000000 / 60)
+			return;
+		last = now;
+	} else {
 		return;
-	last = now;
+	}
 #endif
 
 #ifdef CONFIG_gpu
