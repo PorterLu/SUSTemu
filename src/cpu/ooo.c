@@ -713,13 +713,15 @@ static void ooo_unit_lsu(void)
                 goto lsu_do_fill;
             }
 
-            /* LOAD: probe cache level */
-            int level = vaddr_probe_level(ir->mem_addr);
+            /* LOAD: probe cache level, read data on L1 hit (single lookup) */
+            word_t l1_data;
+            int level = vaddr_probe_and_read_l1(ir->mem_addr, ir->mem_width, &l1_data);
             int lat   = level_to_lat[level];
 
             if (lat == 1) {
-                /* L1 hit: fill immediately (INT unit runs before LSU, so any
-                 * same-cycle branch misprediction flush has already happened) */
+                /* L1 hit: data already read, pass to lsu_do_fill via latch */
+                ooo.latch_lsu[s].src1_val = l1_data;
+                ooo.latch_lsu[s].cycles_rem = 0;  /* signal pre-read to lsu_do_fill */
                 goto lsu_do_fill;
             }
 
@@ -772,7 +774,13 @@ lsu_do_fill:
                 ooo.latch_lsu[s].valid = 0;
                 continue;
             }
-            word_t raw = vaddr_fill_and_read(ir->mem_addr, ir->mem_width);
+            word_t raw;
+            if (ooo.latch_lsu[s].cycles_rem == 0 && mi == -1) {
+                /* L1 hit with pre-read data from merged probe; skip second lookup */
+                raw = ooo.latch_lsu[s].src1_val;
+            } else {
+                raw = vaddr_fill_and_read(ir->mem_addr, ir->mem_width);
+            }
             if (ir->mem_sign) {
                 switch (ir->mem_width) {
                 case 1: ir->result = SEXT(raw,  8); break;

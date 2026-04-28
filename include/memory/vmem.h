@@ -23,5 +23,11 @@ int vaddr_probe_level(vaddr_t addr);
  * Called when the OOO MEM-stage countdown expires (deferred cache fill). */
 word_t vaddr_fill_and_read(vaddr_t addr, int len);
 
+/* vaddr_probe_and_read_l1 — single-lookup probe + optional read for L1 hit.
+ * Uses cache_probe_and_read_l1; on L1 hit reads data in the same lookup.
+ * On miss returns the cache level without side effects on L1.
+ * Returns: 0 = L1 hit (data in *out_val), 1 = L2 hit, 2 = DRAM. */
+int vaddr_probe_and_read_l1(vaddr_t addr, int len, word_t *out_val);
+
 
 #endif

@@ -60,6 +60,23 @@ word_t vaddr_fill_and_read(vaddr_t addr, int len)
 	}
 }
 
+int vaddr_probe_and_read_l1(vaddr_t addr, int len, word_t *out_val)
+{
+	if (addr >= 0x80000000 && addr < 0x88000000) {
+		if (g_num_cores > 1) {
+			int other = 1 - g_current_hartid;
+			cache_snoop_flush_dirty(cores[other].l1d, L2_cache, addr);
+		}
+		return cache_probe_and_read_l1(L1D_cache, L2_cache, addr, len, out_val);
+	} else {
+		/* Non-cacheable range (MMIO or invalid speculative addr).
+		 * Return L1-hit latency and let lsu_do_fill handle it
+		 * (speculative loads to invalid addrs are faulted there). */
+		*out_val = 0;
+		return 0;
+	}
+}
+
 void vaddr_write(vaddr_t addr, int len, word_t data)
 {
 	if (addr >= 0x80000000 && addr < 0x88000000) {

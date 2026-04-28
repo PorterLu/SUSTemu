@@ -267,6 +267,27 @@ word_t cache_fill_and_read(Cache *l1, Cache *l2, paddr_t addr, int len)
     return res;
 }
 
+int cache_probe_and_read_l1(Cache *l1, Cache *l2, paddr_t addr, int len, word_t *out_val)
+{
+    int l1_hit;
+    CacheLine *line = find_line_quiet(l1, addr, &l1_hit);
+    if (l1_hit) {
+        /* Single lookup for L1 hit: apply stats that find_line would do.
+         * find_line_quiet already set mru_way; we fill in timer/hits/last_access. */
+        l1->timer++;
+        l1->hits++;
+        line->last_access = l1->timer;
+
+        uint32_t offset = addr & (BLOCK_SIZE - 1);
+        memcpy(out_val, line->data + offset, len);
+        return 0;
+    }
+    /* L1 miss: probe L2 quietly, no L1 stats touched (fill happens later) */
+    int l2_hit;
+    find_line_quiet(l2, addr, &l2_hit);
+    return l2_hit ? 1 : 2;
+}
+
 void cache_write(Cache *l1, Cache *l2, paddr_t addr, int len, word_t data) {
     int hit;
     CacheLine *line = find_line(l1, addr, &hit);

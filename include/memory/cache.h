@@ -58,6 +58,13 @@ int cache_probe_level(Cache *l1, Cache *l2, paddr_t addr);
  * Called when the OOO MEM-stage countdown expires. */
 word_t cache_fill_and_read(Cache *l1, Cache *l2, paddr_t addr, int len);
 
+/* cache_probe_and_read_l1: single-lookup probe + optional read for L1.
+ * Uses a quiet L1 lookup first; on L1 hit, applies stats updates and reads
+ * data in one pass (avoiding a second lookup via cache_fill_and_read).
+ * On L1 miss, probes L2 quietly and returns the level without touching L1.
+ * Returns: 0 = L1 hit (data in *out_val), 1 = L2 hit, 2 = DRAM miss. */
+int cache_probe_and_read_l1(Cache *l1, Cache *l2, paddr_t addr, int len, word_t *out_val);
+
 #define PREFETCH_DEGREE 2
 void cache_prefetch(Cache *l1, Cache *l2, paddr_t miss_addr);
 
