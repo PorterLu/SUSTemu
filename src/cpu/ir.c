@@ -158,13 +158,132 @@ static void ir_fill_operands(IR_Inst *ir, uint32_t i, int type)
     }
 }
 
+/* ── Decode table entry ─────────────────────────────────────────────────── */
+
+typedef struct {
+    const char *name;
+    void       (*exec_fn)(IR_Inst *, CPU_state *);
+    int8_t      fmt;       /* TYPE_* operand format, or -1 for invalid */
+} DEntry;
+
+#define E(n, fn, f) { (n), (fn), (f) }
+#define X { NULL, NULL, -1 }   /* invalid entry */
+
+/* ── Decode table [32 opcodes][8 funct3] ────────────────────────────────── */
+
+static const DEntry decode_table[32][8] = {
+
+    /* 0x00  LOAD */
+    [0x00] = {
+        [0] = E("lb",  ir_exec_lb,  TYPE_I),
+        [1] = E("lh",  ir_exec_lh,  TYPE_I),
+        [2] = E("lw",  ir_exec_lw,  TYPE_I),
+        [3] = E("ld",  ir_exec_ld,  TYPE_I),
+        [4] = E("lbu", ir_exec_lbu, TYPE_I),
+        [5] = E("lhu", ir_exec_lhu, TYPE_I),
+        [6] = E("lwu", ir_exec_lwu, TYPE_I),
+    },
+    /* 0x03  FENCE (funct3 ignored) */
+    [0x03] = {
+        [0]=E("fence",ir_exec_fence,TYPE_N), [1]=E("fence",ir_exec_fence,TYPE_N),
+        [2]=E("fence",ir_exec_fence,TYPE_N), [3]=E("fence",ir_exec_fence,TYPE_N),
+        [4]=E("fence",ir_exec_fence,TYPE_N), [5]=E("fence",ir_exec_fence,TYPE_N),
+        [6]=E("fence",ir_exec_fence,TYPE_N), [7]=E("fence",ir_exec_fence,TYPE_N),
+    },
+    /* 0x04  I-type ALU */
+    [0x04] = {
+        [0] = E("addi",  ir_exec_addi,  TYPE_I),
+        [1] = E("slli",  ir_exec_slli,  TYPE_I),
+        [2] = E("slti",  ir_exec_slti,  TYPE_I),
+        [3] = E("sltiu", ir_exec_sltiu, TYPE_I),
+        [4] = E("xori",  ir_exec_xori,  TYPE_I),
+        [5] = E("srli",  ir_exec_srli,  TYPE_I), /* may be srai */
+        [6] = E("ori",   ir_exec_ori,   TYPE_I),
+        [7] = E("andi",  ir_exec_andi,  TYPE_I),
+    },
+    /* 0x05  AUIPC (funct3 ignored) */
+    [0x05] = {
+        [0]=E("auipc",ir_exec_auipc,TYPE_U), [1]=E("auipc",ir_exec_auipc,TYPE_U),
+        [2]=E("auipc",ir_exec_auipc,TYPE_U), [3]=E("auipc",ir_exec_auipc,TYPE_U),
+        [4]=E("auipc",ir_exec_auipc,TYPE_U), [5]=E("auipc",ir_exec_auipc,TYPE_U),
+        [6]=E("auipc",ir_exec_auipc,TYPE_U), [7]=E("auipc",ir_exec_auipc,TYPE_U),
+    },
+    /* 0x06  I-type W */
+    [0x06] = {
+        [0] = E("addiw", ir_exec_addiw, TYPE_I),
+        [1] = E("slliw", ir_exec_slliw, TYPE_I),
+        [5] = E("srliw", ir_exec_srliw, TYPE_I), /* may be sraiw */
+    },
+    /* 0x08  STORE */
+    [0x08] = {
+        [0] = E("sb", ir_exec_sb, TYPE_S),
+        [1] = E("sh", ir_exec_sh, TYPE_S),
+        [2] = E("sw", ir_exec_sw, TYPE_S),
+        [3] = E("sd", ir_exec_sd, TYPE_S),
+    },
+    /* 0x0C  R-type  (all funct3 entries post-resolved for funct7) */
+    [0x0C] = {
+        [0] = E("add", ir_exec_add, TYPE_R),
+        [1] = E("sll", ir_exec_sll, TYPE_R),
+        [2] = E("slt", ir_exec_slt, TYPE_R),
+        [3] = E("sltu", ir_exec_sltu, TYPE_R),
+        [4] = E("xor", ir_exec_xor, TYPE_R),
+        [5] = E("srl", ir_exec_srl, TYPE_R),
+        [6] = E("or",  ir_exec_or,  TYPE_R),
+        [7] = E("and", ir_exec_and, TYPE_R),
+    },
+    /* 0x0D  LUI (funct3 ignored) */
+    [0x0D] = {
+        [0]=E("lui",ir_exec_lui,TYPE_U), [1]=E("lui",ir_exec_lui,TYPE_U),
+        [2]=E("lui",ir_exec_lui,TYPE_U), [3]=E("lui",ir_exec_lui,TYPE_U),
+        [4]=E("lui",ir_exec_lui,TYPE_U), [5]=E("lui",ir_exec_lui,TYPE_U),
+        [6]=E("lui",ir_exec_lui,TYPE_U), [7]=E("lui",ir_exec_lui,TYPE_U),
+    },
+    /* 0x0E  R-type W  (all funct3 entries post-resolved for funct7) */
+    [0x0E] = {
+        [0] = E("addw", ir_exec_addw, TYPE_R),
+        [1] = E("sllw", ir_exec_sllw, TYPE_R),
+        [4] = E("divw", ir_exec_divw, TYPE_R),
+        [5] = E("srlw", ir_exec_srlw, TYPE_R),
+        [6] = E("remw", ir_exec_remw, TYPE_R),
+        [7] = E("remuw", ir_exec_remuw, TYPE_R),
+    },
+    /* 0x18  BRANCH */
+    [0x18] = {
+        [0] = E("beq",  ir_exec_beq,  TYPE_B),
+        [1] = E("bne",  ir_exec_bne,  TYPE_B),
+        [4] = E("blt",  ir_exec_blt,  TYPE_B),
+        [5] = E("bge",  ir_exec_bge,  TYPE_B),
+        [6] = E("bltu", ir_exec_bltu, TYPE_B),
+        [7] = E("bgeu", ir_exec_bgeu, TYPE_B),
+    },
+    /* 0x19  JALR (funct3 ignored) */
+    [0x19] = {
+        [0]=E("jalr",ir_exec_jalr,TYPE_I), [1]=E("jalr",ir_exec_jalr,TYPE_I),
+        [2]=E("jalr",ir_exec_jalr,TYPE_I), [3]=E("jalr",ir_exec_jalr,TYPE_I),
+        [4]=E("jalr",ir_exec_jalr,TYPE_I), [5]=E("jalr",ir_exec_jalr,TYPE_I),
+        [6]=E("jalr",ir_exec_jalr,TYPE_I), [7]=E("jalr",ir_exec_jalr,TYPE_I),
+    },
+    /* 0x1B  JAL (funct3 ignored) */
+    [0x1B] = {
+        [0]=E("jal",ir_exec_jal,TYPE_J), [1]=E("jal",ir_exec_jal,TYPE_J),
+        [2]=E("jal",ir_exec_jal,TYPE_J), [3]=E("jal",ir_exec_jal,TYPE_J),
+        [4]=E("jal",ir_exec_jal,TYPE_J), [5]=E("jal",ir_exec_jal,TYPE_J),
+        [6]=E("jal",ir_exec_jal,TYPE_J), [7]=E("jal",ir_exec_jal,TYPE_J),
+    },
+    /* 0x1C  SYSTEM */
+    [0x1C] = {
+        [0] = E("ecall", ir_exec_ecall, TYPE_N), /* resolved by raw in post-resolve */
+        [1] = E("csrrw", ir_exec_csrrw,  TYPE_I),
+        [2] = E("csrrs", ir_exec_csrrs,  TYPE_I),
+        [3] = E("csrrc", ir_exec_csrrc,  TYPE_I),
+    },
+};
+
+#undef E
+#undef X
+
 /* ── ir_decode ──────────────────────────────────────────────────────────── */
-/*
- * Decode `raw` into `*ir`.  The instruction pattern table from
- * include/cpu/inst_table.inc is included with locally-redefined macros so
- * that INSTPAT_MATCH fills IR_Inst fields and sets exec_fn, without running
- * the execution body (__VA_ARGS__ is captured but not expanded here).
- */
 
 void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir)
 {
@@ -187,194 +306,68 @@ void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir)
     ir->cycles_rem      = 0;
     ir->exec_fn         = ir_exec_inv;
 
-    /* Direct opcode dispatch — O(1) vs the original O(n) linear INSTPAT scan.
-     * opcode = bits[6:2] (bits[1:0] are always 11 for RV32/64 instructions).
-     * Within each opcode group, funct3 (bits[14:12]) and funct7 (bits[31:25])
-     * disambiguate. */
     uint8_t opcode = (raw >> 2) & 0x1f;
     uint8_t funct3 = (raw >> 12) & 0x7;
+    const DEntry *e = &decode_table[opcode][funct3];
+
+    if (e->exec_fn) {
+        ir->name    = e->name;
+        ir->exec_fn = e->exec_fn;
+    }
+    if (e->exec_fn && e->fmt >= 0)
+        ir_fill_operands(ir, raw, e->fmt);
+
+    /* ── Post-resolve funct7-dependent and special cases ──────────────── */
     uint8_t funct7 = (raw >> 25) & 0x7f;
 
     switch (opcode) {
-
-    case 0x04: /* I-type ALU: addi ori xori andi slti sltiu slli srli srai */
-        ir_fill_operands(ir, raw, TYPE_I);
-        switch (funct3) {
-        case 0: ir->name = "addi";  ir->exec_fn = ir_exec_addi;  break;
-        case 6: ir->name = "ori";   ir->exec_fn = ir_exec_ori;   break;
-        case 4: ir->name = "xori";  ir->exec_fn = ir_exec_xori;  break;
-        case 7: ir->name = "andi";  ir->exec_fn = ir_exec_andi;  break;
-        case 2: ir->name = "slti";  ir->exec_fn = ir_exec_slti;  break;
-        case 3: ir->name = "sltiu"; ir->exec_fn = ir_exec_sltiu; break;
-        case 1: ir->name = "slli";  ir->exec_fn = ir_exec_slli;  break;
-        case 5:
-            if ((funct7 >> 1) == 0x20) { ir->name = "srai"; ir->exec_fn = ir_exec_srai; }
-            else                        { ir->name = "srli"; ir->exec_fn = ir_exec_srli; }
-            break;
-        default: break;
-        }
+    case 0x04: /* I-type: srai vs srli */
+        if (funct3 == 5 && (funct7 >> 1) == 0x20)
+        { ir->name = "srai"; ir->exec_fn = ir_exec_srai; }
         break;
-
-    case 0x00: /* Loads: lb lh lw ld lbu lhu lwu */
-        ir_fill_operands(ir, raw, TYPE_I);
-        switch (funct3) {
-        case 4: ir->name = "lbu"; ir->exec_fn = ir_exec_lbu; break;
-        case 0: ir->name = "lb";  ir->exec_fn = ir_exec_lb;  break;
-        case 2: ir->name = "lw";  ir->exec_fn = ir_exec_lw;  break;
-        case 3: ir->name = "ld";  ir->exec_fn = ir_exec_ld;  break;
-        case 1: ir->name = "lh";  ir->exec_fn = ir_exec_lh;  break;
-        case 5: ir->name = "lhu"; ir->exec_fn = ir_exec_lhu; break;
-        case 6: ir->name = "lwu"; ir->exec_fn = ir_exec_lwu; break;
-        default: break;
-        }
+    case 0x06: /* I-type W: sraiw vs srliw */
+        if (funct3 == 5 && funct7 == 0x20)
+        { ir->name = "sraiw"; ir->exec_fn = ir_exec_sraiw; }
         break;
-
-    case 0x08: /* Stores: sb sh sw sd */
-        ir_fill_operands(ir, raw, TYPE_S);
-        switch (funct3) {
-        case 0: ir->name = "sb"; ir->exec_fn = ir_exec_sb; break;
-        case 1: ir->name = "sh"; ir->exec_fn = ir_exec_sh; break;
-        case 2: ir->name = "sw"; ir->exec_fn = ir_exec_sw; break;
-        case 3: ir->name = "sd"; ir->exec_fn = ir_exec_sd; break;
-        default: break;
-        }
-        break;
-
-    case 0x18: /* Branches: beq bne blt bge bltu bgeu */
-        ir_fill_operands(ir, raw, TYPE_B);
-        switch (funct3) {
-        case 0: ir->name = "beq";  ir->exec_fn = ir_exec_beq;  break;
-        case 1: ir->name = "bne";  ir->exec_fn = ir_exec_bne;  break;
-        case 4: ir->name = "blt";  ir->exec_fn = ir_exec_blt;  break;
-        case 5: ir->name = "bge";  ir->exec_fn = ir_exec_bge;  break;
-        case 6: ir->name = "bltu"; ir->exec_fn = ir_exec_bltu; break;
-        case 7: ir->name = "bgeu"; ir->exec_fn = ir_exec_bgeu; break;
-        default: break;
-        }
-        break;
-
-    case 0x1b: /* JAL */
-        ir_fill_operands(ir, raw, TYPE_J);
-        ir->name = "jal"; ir->exec_fn = ir_exec_jal;
-        break;
-
-    case 0x19: /* JALR */
-        ir_fill_operands(ir, raw, TYPE_I);
-        ir->name = "jalr"; ir->exec_fn = ir_exec_jalr;
-        break;
-
-    case 0x05: /* AUIPC */
-        ir_fill_operands(ir, raw, TYPE_U);
-        ir->name = "auipc"; ir->exec_fn = ir_exec_auipc;
-        break;
-
-    case 0x0d: /* LUI */
-        ir_fill_operands(ir, raw, TYPE_U);
-        ir->name = "lui"; ir->exec_fn = ir_exec_lui;
-        break;
-
-    case 0x06: /* I-type W: addiw slliw srliw sraiw */
-        ir_fill_operands(ir, raw, TYPE_I);
-        switch (funct3) {
-        case 0: ir->name = "addiw"; ir->exec_fn = ir_exec_addiw; break;
-        case 1: ir->name = "slliw"; ir->exec_fn = ir_exec_slliw; break;
-        case 5:
-            if (funct7 == 0x20) { ir->name = "sraiw"; ir->exec_fn = ir_exec_sraiw; }
-            else                 { ir->name = "srliw"; ir->exec_fn = ir_exec_srliw; }
-            break;
-        default: break;
-        }
-        break;
-
-    case 0x0c: /* R-type: add sub mul or xor and slt sltu sll srl sra div divu rem remu */
-        ir_fill_operands(ir, raw, TYPE_R);
+    case 0x0C: /* R-type: sub mul div divu rem remu sra */
         switch (funct3) {
         case 0:
-            if      (funct7 == 0x00) { ir->name = "add";  ir->exec_fn = ir_exec_add;  }
-            else if (funct7 == 0x20) { ir->name = "sub";  ir->exec_fn = ir_exec_sub;  }
-            else if (funct7 == 0x01) { ir->name = "mul";  ir->exec_fn = ir_exec_mul;  }
+            if      (funct7 == 0x20) { ir->name = "sub"; ir->exec_fn = ir_exec_sub; }
+            else if (funct7 == 0x01) { ir->name = "mul"; ir->exec_fn = ir_exec_mul; }
             break;
-        case 6:
-            if      (funct7 == 0x00) { ir->name = "or";   ir->exec_fn = ir_exec_or;   }
-            else if (funct7 == 0x01) { ir->name = "rem";  ir->exec_fn = ir_exec_rem;  }
-            break;
-        case 4:
-            if      (funct7 == 0x00) { ir->name = "xor";  ir->exec_fn = ir_exec_xor;  }
-            else if (funct7 == 0x01) { ir->name = "div";  ir->exec_fn = ir_exec_div;  }
-            break;
-        case 7:
-            if      (funct7 == 0x00) { ir->name = "and";  ir->exec_fn = ir_exec_and;  }
-            else if (funct7 == 0x01) { ir->name = "remu"; ir->exec_fn = ir_exec_remu; }
-            break;
-        case 2:
-            if      (funct7 == 0x00) { ir->name = "slt";  ir->exec_fn = ir_exec_slt;  }
-            break;
-        case 3:
-            if      (funct7 == 0x00) { ir->name = "sltu"; ir->exec_fn = ir_exec_sltu; }
-            else if (funct7 == 0x01) { ir->name = "divu"; ir->exec_fn = ir_exec_divu; }
-            break;
-        case 1:
-            if      (funct7 == 0x00) { ir->name = "sll";  ir->exec_fn = ir_exec_sll;  }
-            break;
+        case 6: if (funct7 == 0x01) { ir->name = "rem";  ir->exec_fn = ir_exec_rem;  } break;
+        case 4: if (funct7 == 0x01) { ir->name = "div";  ir->exec_fn = ir_exec_div;  } break;
+        case 7: if (funct7 == 0x01) { ir->name = "remu"; ir->exec_fn = ir_exec_remu; } break;
+        case 3: if (funct7 == 0x01) { ir->name = "divu"; ir->exec_fn = ir_exec_divu; } break;
         case 5:
-            if      (funct7 == 0x00) { ir->name = "srl";  ir->exec_fn = ir_exec_srl;  }
-            else if (funct7 == 0x20) { ir->name = "sra";  ir->exec_fn = ir_exec_sra;  }
+            if      (funct7 == 0x20) { ir->name = "sra";  ir->exec_fn = ir_exec_sra;  }
             else if (funct7 == 0x01) { ir->name = "divu"; ir->exec_fn = ir_exec_divu; }
             break;
-        default: break;
         }
         break;
-
-    case 0x0e: /* R-type W: addw subw mulw sllw srlw sraw divw divuw remw remuw */
-        ir_fill_operands(ir, raw, TYPE_R);
+    case 0x0E: /* R-type W: subw mulw divuw sraw */
         switch (funct3) {
         case 0:
-            if      (funct7 == 0x00) { ir->name = "addw";  ir->exec_fn = ir_exec_addw;  }
-            else if (funct7 == 0x20) { ir->name = "subw";  ir->exec_fn = ir_exec_subw;  }
+            if      (funct7 == 0x20) { ir->name = "subw";  ir->exec_fn = ir_exec_subw;  }
             else if (funct7 == 0x01) { ir->name = "mulw";  ir->exec_fn = ir_exec_mulw;  }
             break;
-        case 1:
-            if      (funct7 == 0x00) { ir->name = "sllw";  ir->exec_fn = ir_exec_sllw;  }
-            break;
         case 5:
-            if      (funct7 == 0x00) { ir->name = "srlw";  ir->exec_fn = ir_exec_srlw;  }
-            else if (funct7 == 0x20) { ir->name = "sraw";  ir->exec_fn = ir_exec_sraw;  }
+            if      (funct7 == 0x20) { ir->name = "sraw";  ir->exec_fn = ir_exec_sraw;  }
             else if (funct7 == 0x01) { ir->name = "divuw"; ir->exec_fn = ir_exec_divuw; }
             break;
-        case 4:
-            if      (funct7 == 0x01) { ir->name = "divw";  ir->exec_fn = ir_exec_divw;  }
-            break;
-        case 6:
-            if      (funct7 == 0x01) { ir->name = "remw";  ir->exec_fn = ir_exec_remw;  }
-            break;
-        case 7:
-            if      (funct7 == 0x01) { ir->name = "remuw"; ir->exec_fn = ir_exec_remuw; }
-            break;
-        default: break;
         }
         break;
-
-    case 0x1c: /* System: csrrw csrrs csrrc ecall mret ebreak */
-        switch (funct3) {
-        case 1: ir_fill_operands(ir, raw, TYPE_I); ir->name = "csrrw";  ir->exec_fn = ir_exec_csrrw;  ir->serializing = 1; break;
-        case 2: ir_fill_operands(ir, raw, TYPE_I); ir->name = "csrrs";  ir->exec_fn = ir_exec_csrrs;  ir->serializing = 1; break;
-        case 3: ir_fill_operands(ir, raw, TYPE_I); ir->name = "csrrc";  ir->exec_fn = ir_exec_csrrc;  ir->serializing = 1; break;
-        case 0:
-            ir_fill_operands(ir, raw, TYPE_N);
-            if      (raw == 0x00000073) { ir->name = "ecall";  ir->exec_fn = ir_exec_ecall;  ir->serializing = 1; }
-            else if (raw == 0x30200073) { ir->name = "mret";   ir->exec_fn = ir_exec_mret;   ir->serializing = 1; }
-            else if (raw == 0x00100073) { ir->name = "ebreak"; ir->exec_fn = ir_exec_ebreak; ir->serializing = 1; }
-            break;
-        default: break;
+    case 0x1C: /* System: ecall / mret / ebreak — resolve by raw value */
+        if (funct3 == 0) {
+            ir->serializing = 1;
+            if      (raw == 0x00000073) { ir->name = "ecall";  ir->exec_fn = ir_exec_ecall;  }
+            else if (raw == 0x30200073) { ir->name = "mret";   ir->exec_fn = ir_exec_mret;   }
+            else if (raw == 0x00100073) { ir->name = "ebreak"; ir->exec_fn = ir_exec_ebreak; }
         }
+        if (funct3 >= 1 && funct3 <= 3) ir->serializing = 1;
         break;
-
     case 0x03: /* Fence */
-        ir_fill_operands(ir, raw, TYPE_N);
-        ir->name = "fence"; ir->exec_fn = ir_exec_fence; ir->serializing = 1;
-        break;
-
-    default:
+        ir->serializing = 1;
         break;
     }
 }
