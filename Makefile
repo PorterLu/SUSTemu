@@ -27,13 +27,13 @@ ifeq ($(UNAME_S),Darwin)
   BREW_RL   = /opt/homebrew/opt/readline
 
   LIBS = -lSDL2 -lreadline
-  CFLAGS = -O3 -march=native -Wall -Wno-format -MMD $(INC_PATH)
+  CFLAGS = -O3 -march=native -flto -Wall -Wno-format -MMD $(INC_PATH)
   CFLAGS += -I$(BREW_SDL2)/include -I$(BREW_RL)/include
   CXXFLAGS = $(shell $(LLVM_CONFIG) --cxxflags)
   CXXFLAGS += -fno-exceptions -fPIE
   CXXFLAGS += $(CFLAGS)
   ASFLAGS = -MMD -O0 $(INC_PATH)
-  LDFLAGS = -O2 -L$(BREW_SDL2)/lib -L$(BREW_RL)/lib $(LIBS)
+  LDFLAGS = -O2 -flto -L$(BREW_SDL2)/lib -L$(BREW_RL)/lib $(LIBS)
   LDFLAGS += $(shell $(LLVM_CONFIG) --ldflags)
   LDFLAGS += $(shell $(LLVM_CONFIG) --libs)
 else
