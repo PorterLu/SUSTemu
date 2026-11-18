@@ -19,6 +19,7 @@
 #include <reg.h>
 #include <csr.h>
 #include <vmem.h>
+#include <pmem.h>
 #include <state.h>
 #include <elftl.h>
 #include <string.h>
@@ -156,6 +157,41 @@ static void ir_fill_operands(IR_Inst *ir, uint32_t i, int type)
         ir->rs2 = -1;
         break;
     }
+}
+
+/* AMO executor: handles all AMO operations using imm=funct5 and taken=is_word */
+static void ir_exec_amo(IR_Inst *ir, CPU_state *cpu) {
+    word_t addr = ir->src1_val;
+    word_t val  = ir->src2_val;
+    word_t old_val;
+    word_t new_val;
+    int len = ir->taken ? 4 : 8;
+
+    /* Direct pmem access for AMO (bypass cache for correctness) */
+    old_val = host_read(guest_to_host(addr), len);
+
+    switch (ir->imm) {
+    case 0x00: new_val = old_val + val; break;
+    case 0x01: new_val = val;           break;
+    case 0x04: new_val = old_val ^ val; break;
+    case 0x0C: new_val = old_val & val; break;
+    case 0x08: new_val = old_val | val; break;
+    case 0x10: if (len == 4) new_val = ((int32_t)old_val < (int32_t)val) ? old_val : val;
+               else new_val = ((int64_t)old_val < (int64_t)val) ? old_val : val; break;
+    case 0x14: if (len == 4) new_val = ((int32_t)old_val > (int32_t)val) ? old_val : val;
+               else new_val = ((int64_t)old_val > (int64_t)val) ? old_val : val; break;
+    case 0x18: new_val = (old_val < val) ? old_val : val; break;
+    case 0x1C: new_val = (old_val > val) ? old_val : val; break;
+    default:  new_val = old_val; break;
+    }
+
+    host_write(guest_to_host(addr), len, new_val);
+
+    /* Set ir->result so ir_writeback commits it properly */
+    if (len == 4)
+        ir->result = (int64_t)(int32_t)old_val;
+    else
+        ir->result = old_val;
 }
 
 /* ── ir_decode ──────────────────────────────────────────────────────────── */
@@ -374,6 +410,23 @@ void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir)
         ir->name = "fence"; ir->exec_fn = ir_exec_fence; ir->serializing = 1;
         break;
 
+    case 0x0B: /* AMO */
+        ir_fill_operands(ir, raw, TYPE_R);
+        {
+            uint8_t funct5 = raw >> 27;
+            uint8_t is_word = (funct3 == 2);
+            ir->type = ITYPE_ALU;
+            ir->imm = funct5;
+            ir->taken = is_word;
+            ir->exec_fn = ir_exec_amo;
+            if (funct5 == 0x00) ir->name = is_word ? "amoadd.w" : "amoadd.d";
+            else if (funct5 == 0x01) ir->name = is_word ? "amoswap.w" : "amoswap.d";
+            else if (funct5 == 0x04) ir->name = is_word ? "amoxor.w" : "amoxor.d";
+            else if (funct5 == 0x0C) ir->name = is_word ? "amoand.w" : "amoand.d";
+            else if (funct5 == 0x08) ir->name = is_word ? "amoor.w" : "amoor.d";
+            else ir->name = "amo";
+        }
+        break;
     default:
         break;
     }
