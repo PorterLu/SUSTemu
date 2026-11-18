@@ -21,7 +21,7 @@ uint32_t csr_table[][4] = {
 	{MIDELEG, MACHINE, true, true},
 	{MIE, MACHINE, true, true},
 	{MTVEC, MACHINE, true, true},
-	{MCOUNTERN, MACHINE, true, false},
+	{MCOUNTERN, MACHINE, true, true},
 	{MSCRATCH, MACHINE, true, true},
 	{MEPC, MACHINE, true, true},
 	{MCAUSE, MACHINE, true, true},
@@ -107,6 +107,7 @@ void set_csr(uint64_t no, uint64_t data){
 		case MIDELEG: csr.mideleg = data; return;
 		case MEDELEG: csr.medeleg = data; return;
 		case MSCRATCH: csr.mscratch = data; return;
+		case MCOUNTERN: csr.mcounteren = data; return;
 		case SSTATUS: csr.sstatus = data; return;
 		case SIE: csr.sie = data; return;
 		case STVEC: csr.stvec = data; return;
@@ -146,8 +147,9 @@ word_t read_csr(uint64_t no){
 		case MIE: return csr.mie;
 		case MIDELEG: return csr.mideleg;
 		case MEDELEG: return csr.medeleg;
-		case MISA: return 0x8000000000001100ULL;
+		case MISA: return 0x8000000000041101ULL;
 		case MSCRATCH: return csr.mscratch;
+		case MCOUNTERN: return csr.mcounteren;
 		case SSTATUS: return csr.sstatus;
 		case SIE: return csr.sie;
 		case STVEC: return csr.stvec;

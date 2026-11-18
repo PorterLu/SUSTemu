@@ -95,6 +95,7 @@ typedef struct {
 	word_t mtval;
 	word_t misa;
 	word_t mscratch;
+	word_t mcounteren;
 	word_t sstatus;
 	word_t sepc;
 	word_t scause;

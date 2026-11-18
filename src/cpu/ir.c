@@ -1041,8 +1041,9 @@ static void ir_exec_ebreak(IR_Inst *ir, CPU_state *cpu)
     ir->type        = ITYPE_SYSTEM;
     ir->serializing = 1;
     ir->rd          = -1;
-    state           = NEMU_END;
-    ir->dnpc        = ir->snpc;
+	ir->dnpc        = raise_intr(3, ir->pc, 0);
+	csr.mtval       = ir->pc;
+	exception_priv_transfer();
 }
 
 /* ── Misc ────────────────────────────────────────────────── */
