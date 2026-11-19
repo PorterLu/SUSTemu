@@ -23,6 +23,7 @@
 #include <state.h>
 #include <elftl.h>
 #include <string.h>
+
 #include <exec_cfg.h>
 
 /* ── Forward declarations of per-instruction executor functions ─────────── */
@@ -31,6 +32,9 @@ static void ir_exec_auipc (IR_Inst *ir, CPU_state *cpu);
 static void ir_exec_lui   (IR_Inst *ir, CPU_state *cpu);
 static void ir_exec_add   (IR_Inst *ir, CPU_state *cpu);
 static void ir_exec_mul   (IR_Inst *ir, CPU_state *cpu);
+static void ir_exec_mulh  (IR_Inst *ir, CPU_state *cpu);
+static void ir_exec_mulhsu(IR_Inst *ir, CPU_state *cpu);
+static void ir_exec_mulhu (IR_Inst *ir, CPU_state *cpu);
 static void ir_exec_sub   (IR_Inst *ir, CPU_state *cpu);
 static void ir_exec_or    (IR_Inst *ir, CPU_state *cpu);
 static void ir_exec_xor   (IR_Inst *ir, CPU_state *cpu);
@@ -89,8 +93,13 @@ static void ir_exec_sb    (IR_Inst *ir, CPU_state *cpu);
 static void ir_exec_csrrw (IR_Inst *ir, CPU_state *cpu);
 static void ir_exec_csrrs (IR_Inst *ir, CPU_state *cpu);
 static void ir_exec_csrrc (IR_Inst *ir, CPU_state *cpu);
+static void ir_exec_csrrwi(IR_Inst *ir, CPU_state *cpu);
+static void ir_exec_csrrsi(IR_Inst *ir, CPU_state *cpu);
+static void ir_exec_csrrci(IR_Inst *ir, CPU_state *cpu);
 static void ir_exec_ecall (IR_Inst *ir, CPU_state *cpu);
 static void ir_exec_mret  (IR_Inst *ir, CPU_state *cpu);
+static void ir_exec_sret  (IR_Inst *ir, CPU_state *cpu);
+static void ir_exec_nop   (IR_Inst *ir, CPU_state *cpu);
 static void ir_exec_ebreak(IR_Inst *ir, CPU_state *cpu);
 static void ir_exec_fence_i(IR_Inst *ir, CPU_state *cpu);
 static void ir_exec_fence  (IR_Inst *ir, CPU_state *cpu);
@@ -159,18 +168,33 @@ static void ir_fill_operands(IR_Inst *ir, uint32_t i, int type)
     }
 }
 
-/* AMO executor: handles all AMO operations using imm=funct5 and taken=is_word */
+/* AMO executor: handles all AMO operations using imm=funct5 and taken=is_word.
+ * With a single hart the reservation of LR is never broken, so SC always
+ * succeeds. */
 static void ir_exec_amo(IR_Inst *ir, CPU_state *cpu) {
     word_t addr = ir->src1_val;
     word_t val  = ir->src2_val;
     word_t old_val;
     word_t new_val;
     int len = ir->taken ? 4 : 8;
+    const int funct5 = (int)ir->imm;
 
+    ir->type = ITYPE_ALU;
+    ir->dnpc = ir->snpc;
     /* Direct pmem access for AMO (bypass cache for correctness) */
     old_val = host_read(guest_to_host(addr), len);
 
-    switch (ir->imm) {
+    if (funct5 == 0x02) {                       /* LR */
+        ir->result = (len == 4) ? (word_t)(int64_t)(int32_t)old_val : old_val;
+        return;
+    }
+    if (funct5 == 0x03) {                       /* SC */
+        host_write(guest_to_host(addr), len, val);
+        ir->result = 0;
+        return;
+    }
+
+    switch (funct5) {
     case 0x00: new_val = old_val + val; break;
     case 0x01: new_val = val;           break;
     case 0x04: new_val = old_val ^ val; break;
@@ -180,18 +204,16 @@ static void ir_exec_amo(IR_Inst *ir, CPU_state *cpu) {
                else new_val = ((int64_t)old_val < (int64_t)val) ? old_val : val; break;
     case 0x14: if (len == 4) new_val = ((int32_t)old_val > (int32_t)val) ? old_val : val;
                else new_val = ((int64_t)old_val > (int64_t)val) ? old_val : val; break;
-    case 0x18: new_val = (old_val < val) ? old_val : val; break;
-    case 0x1C: new_val = (old_val > val) ? old_val : val; break;
+    case 0x18: if (len == 4) new_val = ((uint32_t)old_val < (uint32_t)val) ? old_val : val;
+               else new_val = (old_val < val) ? old_val : val; break;
+    case 0x1C: if (len == 4) new_val = ((uint32_t)old_val > (uint32_t)val) ? old_val : val;
+               else new_val = (old_val > val) ? old_val : val; break;
     default:  new_val = old_val; break;
     }
 
     host_write(guest_to_host(addr), len, new_val);
-
-    /* Set ir->result so ir_writeback commits it properly */
-    if (len == 4)
-        ir->result = (int64_t)(int32_t)old_val;
-    else
-        ir->result = old_val;
+    ir->result = (len == 4) ? (word_t)(int64_t)(int32_t)old_val : old_val;
+    (void)cpu;
 }
 
 /* ── ir_decode ──────────────────────────────────────────────────────────── */
@@ -227,6 +249,9 @@ void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir)
      * opcode = bits[6:2] (bits[1:0] are always 11 for RV32/64 instructions).
      * Within each opcode group, funct3 (bits[14:12]) and funct7 (bits[31:25])
      * disambiguate. */
+    if ((raw & 3) != 3)
+        return;             /* not a 32-bit encoding: invalid */
+
     uint8_t opcode = (raw >> 2) & 0x1f;
     uint8_t funct3 = (raw >> 12) & 0x7;
     uint8_t funct7 = (raw >> 25) & 0x7f;
@@ -244,7 +269,7 @@ void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir)
         case 3: ir->name = "sltiu"; ir->exec_fn = ir_exec_sltiu; break;
         case 1: ir->name = "slli";  ir->exec_fn = ir_exec_slli;  break;
         case 5:
-            if ((funct7 >> 1) == 0x20) { ir->name = "srai"; ir->exec_fn = ir_exec_srai; }
+            if ((funct7 >> 1) == 0x10) { ir->name = "srai"; ir->exec_fn = ir_exec_srai; }
             else                        { ir->name = "srli"; ir->exec_fn = ir_exec_srli; }
             break;
         default: break;
@@ -344,13 +369,15 @@ void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir)
             break;
         case 2:
             if      (funct7 == 0x00) { ir->name = "slt";  ir->exec_fn = ir_exec_slt;  }
+            else if (funct7 == 0x01) { ir->name = "mulhsu"; ir->exec_fn = ir_exec_mulhsu; }
             break;
         case 3:
             if      (funct7 == 0x00) { ir->name = "sltu"; ir->exec_fn = ir_exec_sltu; }
-            else if (funct7 == 0x01) { ir->name = "divu"; ir->exec_fn = ir_exec_divu; }
+            else if (funct7 == 0x01) { ir->name = "mulhu"; ir->exec_fn = ir_exec_mulhu; }
             break;
         case 1:
             if      (funct7 == 0x00) { ir->name = "sll";  ir->exec_fn = ir_exec_sll;  }
+            else if (funct7 == 0x01) { ir->name = "mulh"; ir->exec_fn = ir_exec_mulh; }
             break;
         case 5:
             if      (funct7 == 0x00) { ir->name = "srl";  ir->exec_fn = ir_exec_srl;  }
@@ -395,11 +422,20 @@ void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir)
         case 1: ir_fill_operands(ir, raw, TYPE_I); ir->name = "csrrw";  ir->exec_fn = ir_exec_csrrw;  ir->serializing = 1; break;
         case 2: ir_fill_operands(ir, raw, TYPE_I); ir->name = "csrrs";  ir->exec_fn = ir_exec_csrrs;  ir->serializing = 1; break;
         case 3: ir_fill_operands(ir, raw, TYPE_I); ir->name = "csrrc";  ir->exec_fn = ir_exec_csrrc;  ir->serializing = 1; break;
+        case 5: ir_fill_operands(ir, raw, TYPE_I); ir->imm = (raw >> 15) & 0x1f;
+                ir->name = "csrrwi"; ir->exec_fn = ir_exec_csrrwi; ir->serializing = 1; break;
+        case 6: ir_fill_operands(ir, raw, TYPE_I); ir->imm = (raw >> 15) & 0x1f;
+                ir->name = "csrrsi"; ir->exec_fn = ir_exec_csrrsi; ir->serializing = 1; break;
+        case 7: ir_fill_operands(ir, raw, TYPE_I); ir->imm = (raw >> 15) & 0x1f;
+                ir->name = "csrrci"; ir->exec_fn = ir_exec_csrrci; ir->serializing = 1; break;
         case 0:
             ir_fill_operands(ir, raw, TYPE_N);
             if      (raw == 0x00000073) { ir->name = "ecall";  ir->exec_fn = ir_exec_ecall;  ir->serializing = 1; }
             else if (raw == 0x30200073) { ir->name = "mret";   ir->exec_fn = ir_exec_mret;   ir->serializing = 1; }
             else if (raw == 0x00100073) { ir->name = "ebreak"; ir->exec_fn = ir_exec_ebreak; ir->serializing = 1; }
+            else if (raw == 0x10200073) { ir->name = "sret";   ir->exec_fn = ir_exec_sret;   ir->serializing = 1; }
+            else if (raw == 0x10500073) { ir->name = "wfi";    ir->exec_fn = ir_exec_nop;    ir->serializing = 1; }
+            else if ((raw & 0xfe007fff) == 0x12000073) { ir->name = "sfence.vma"; ir->exec_fn = ir_exec_nop; ir->serializing = 1; }
             break;
         default: break;
         }
@@ -415,16 +451,21 @@ void ir_decode(uint32_t raw, vaddr_t pc, vaddr_t snpc, IR_Inst *ir)
         {
             uint8_t funct5 = raw >> 27;
             uint8_t is_word = (funct3 == 2);
-            ir->type = ITYPE_ALU;
-            ir->imm = funct5;
-            ir->taken = is_word;
-            ir->exec_fn = ir_exec_amo;
-            if (funct5 == 0x00) ir->name = is_word ? "amoadd.w" : "amoadd.d";
-            else if (funct5 == 0x01) ir->name = is_word ? "amoswap.w" : "amoswap.d";
-            else if (funct5 == 0x04) ir->name = is_word ? "amoxor.w" : "amoxor.d";
-            else if (funct5 == 0x0C) ir->name = is_word ? "amoand.w" : "amoand.d";
-            else if (funct5 == 0x08) ir->name = is_word ? "amoor.w" : "amoor.d";
-            else ir->name = "amo";
+            static const char *const amo_names[32][2] = {
+                [0x00] = {"amoadd.d", "amoadd.w"},   [0x01] = {"amoswap.d", "amoswap.w"},
+                [0x02] = {"lr.d", "lr.w"},           [0x03] = {"sc.d", "sc.w"},
+                [0x04] = {"amoxor.d", "amoxor.w"},   [0x08] = {"amoor.d", "amoor.w"},
+                [0x0C] = {"amoand.d", "amoand.w"},   [0x10] = {"amomin.d", "amomin.w"},
+                [0x14] = {"amomax.d", "amomax.w"},   [0x18] = {"amominu.d", "amominu.w"},
+                [0x1C] = {"amomaxu.d", "amomaxu.w"},
+            };
+            /* only .w and .d widths and the listed operations exist */
+            if ((funct3 == 2 || funct3 == 3) && amo_names[funct5][is_word]) {
+                ir->imm = funct5;
+                ir->taken = is_word;
+                ir->exec_fn = ir_exec_amo;
+                ir->name = amo_names[funct5][is_word];
+            }
         }
         break;
     default:
@@ -544,6 +585,27 @@ static void ir_exec_mul(IR_Inst *ir, CPU_state *cpu)
     ir->dnpc   = ir->snpc;
 }
 
+static void ir_exec_mulh(IR_Inst *ir, CPU_state *cpu)
+{
+    ir->type   = ITYPE_ALU;
+    ir->result = (word_t)(((__int128)(int64_t)ir->src1_val *
+                           (__int128)(int64_t)ir->src2_val) >> 64);
+    ir->dnpc   = ir->snpc;
+}
+static void ir_exec_mulhsu(IR_Inst *ir, CPU_state *cpu)
+{
+    ir->type   = ITYPE_ALU;
+    ir->result = (word_t)(((__int128)(int64_t)ir->src1_val *
+                           (__int128)(unsigned __int128)ir->src2_val) >> 64);
+    ir->dnpc   = ir->snpc;
+}
+static void ir_exec_mulhu(IR_Inst *ir, CPU_state *cpu)
+{
+    ir->type   = ITYPE_ALU;
+    ir->result = (word_t)(((unsigned __int128)ir->src1_val *
+                           (unsigned __int128)ir->src2_val) >> 64);
+    ir->dnpc   = ir->snpc;
+}
 static void ir_exec_sub(IR_Inst *ir, CPU_state *cpu)
 {
     ir->type   = ITYPE_ALU;
@@ -610,28 +672,32 @@ static void ir_exec_sra(IR_Inst *ir, CPU_state *cpu)
 static void ir_exec_div(IR_Inst *ir, CPU_state *cpu)
 {
     ir->type   = ITYPE_ALU;
-    ir->result = (word_t)((int64_t)ir->src1_val / (int64_t)ir->src2_val);
+    const int64_t a = (int64_t)ir->src1_val, b = (int64_t)ir->src2_val;
+    ir->result = b == 0 ? ~(word_t)0
+               : (a == INT64_MIN && b == -1) ? (word_t)a : (word_t)(a / b);
     ir->dnpc   = ir->snpc;
 }
 
 static void ir_exec_divu(IR_Inst *ir, CPU_state *cpu)
 {
     ir->type   = ITYPE_ALU;
-    ir->result = ir->src1_val / ir->src2_val;
+    ir->result = ir->src2_val == 0 ? ~(word_t)0 : ir->src1_val / ir->src2_val;
     ir->dnpc   = ir->snpc;
 }
 
 static void ir_exec_rem(IR_Inst *ir, CPU_state *cpu)
 {
     ir->type   = ITYPE_ALU;
-    ir->result = (word_t)((int64_t)ir->src1_val % (int64_t)ir->src2_val);
+    const int64_t a = (int64_t)ir->src1_val, b = (int64_t)ir->src2_val;
+    ir->result = b == 0 ? (word_t)a
+               : (a == INT64_MIN && b == -1) ? 0 : (word_t)(a % b);
     ir->dnpc   = ir->snpc;
 }
 
 static void ir_exec_remu(IR_Inst *ir, CPU_state *cpu)
 {
     ir->type   = ITYPE_ALU;
-    ir->result = ir->src1_val % ir->src2_val;
+    ir->result = ir->src2_val == 0 ? ir->src1_val : ir->src1_val % ir->src2_val;
     ir->dnpc   = ir->snpc;
 }
 
@@ -686,33 +752,35 @@ static void ir_exec_sraw(IR_Inst *ir, CPU_state *cpu)
 static void ir_exec_divw(IR_Inst *ir, CPU_state *cpu)
 {
     ir->type   = ITYPE_ALU;
-    ir->result = SEXT((word_t)((int32_t)(ir->src1_val & 0xffffffff)
-                               / (int32_t)(ir->src2_val & 0xffffffff)), 32);
+    const int32_t a = (int32_t)ir->src1_val, b = (int32_t)ir->src2_val;
+    ir->result = b == 0 ? ~(word_t)0
+               : (a == INT32_MIN && b == -1) ? (word_t)(int64_t)a
+               : (word_t)(int64_t)(a / b);
     ir->dnpc   = ir->snpc;
 }
 
 static void ir_exec_divuw(IR_Inst *ir, CPU_state *cpu)
 {
     ir->type   = ITYPE_ALU;
-    ir->result = SEXT((ir->src1_val & 0xffffffff) / (ir->src2_val & 0xffffffff),
-                      32);
+    const uint32_t a = (uint32_t)ir->src1_val, b = (uint32_t)ir->src2_val;
+    ir->result = b == 0 ? ~(word_t)0 : (word_t)(int64_t)(int32_t)(a / b);
     ir->dnpc   = ir->snpc;
 }
 
 static void ir_exec_remw(IR_Inst *ir, CPU_state *cpu)
 {
     ir->type   = ITYPE_ALU;
-    ir->result = SEXT((word_t)((int32_t)(ir->src1_val & 0xffffffff)
-                               % (int32_t)(ir->src2_val & 0xffffffff))
-                       & 0xffffffff, 32);
+    const int32_t a = (int32_t)ir->src1_val, b = (int32_t)ir->src2_val;
+    ir->result = b == 0 ? (word_t)(int64_t)a
+               : (a == INT32_MIN && b == -1) ? 0 : (word_t)(int64_t)(a % b);
     ir->dnpc   = ir->snpc;
 }
 
 static void ir_exec_remuw(IR_Inst *ir, CPU_state *cpu)
 {
     ir->type   = ITYPE_ALU;
-    ir->result = SEXT(((ir->src1_val & 0xffffffff) % (ir->src2_val & 0xffffffff))
-                       & 0xffffffff, 32);
+    const uint32_t a = (uint32_t)ir->src1_val, b = (uint32_t)ir->src2_val;
+    ir->result = (word_t)(int64_t)(int32_t)(b == 0 ? a : a % b);
     ir->dnpc   = ir->snpc;
 }
 
@@ -763,14 +831,14 @@ static void ir_exec_sltiu(IR_Inst *ir, CPU_state *cpu)
 static void ir_exec_slli(IR_Inst *ir, CPU_state *cpu)
 {
     ir->type   = ITYPE_ALU;
-    ir->result = ir->src1_val << ir->src2_val;
+    ir->result = ir->src1_val << (ir->src2_val & 0x3f);
     ir->dnpc   = ir->snpc;
 }
 
 static void ir_exec_srli(IR_Inst *ir, CPU_state *cpu)
 {
     ir->type   = ITYPE_ALU;
-    ir->result = ir->src1_val >> ir->src2_val;
+    ir->result = ir->src1_val >> (ir->src2_val & 0x3f);
     ir->dnpc   = ir->snpc;
 }
 
@@ -1016,6 +1084,41 @@ static void ir_exec_csrrc(IR_Inst *ir, CPU_state *cpu)
     ir->dnpc = ir->snpc;
 }
 
+static void ir_exec_csrrwi(IR_Inst *ir, CPU_state *cpu)
+{
+    ir->type        = ITYPE_CSR;
+    ir->serializing = 1;
+    uint32_t csr_no = (uint32_t)(ir->src2_val & 0xfff);
+    ir->result      = read_csr(csr_no);
+    set_csr(csr_no, ir->imm);
+    ir->dnpc        = ir->snpc;
+    (void)cpu;
+}
+
+static void ir_exec_csrrsi(IR_Inst *ir, CPU_state *cpu)
+{
+    ir->type        = ITYPE_CSR;
+    ir->serializing = 1;
+    uint32_t csr_no = (uint32_t)(ir->src2_val & 0xfff);
+    ir->result      = read_csr(csr_no);
+    if (ir->imm != 0)
+        set_csr(csr_no, ir->result | ir->imm);
+    ir->dnpc        = ir->snpc;
+    (void)cpu;
+}
+
+static void ir_exec_csrrci(IR_Inst *ir, CPU_state *cpu)
+{
+    ir->type        = ITYPE_CSR;
+    ir->serializing = 1;
+    uint32_t csr_no = (uint32_t)(ir->src2_val & 0xfff);
+    ir->result      = read_csr(csr_no);
+    if (ir->imm != 0)
+        set_csr(csr_no, ir->result & ~ir->imm);
+    ir->dnpc        = ir->snpc;
+    (void)cpu;
+}
+
 /* ── System instructions ─────────────────────────────────── */
 
 static void ir_exec_ecall(IR_Inst *ir, CPU_state *cpu)
@@ -1023,8 +1126,8 @@ static void ir_exec_ecall(IR_Inst *ir, CPU_state *cpu)
     ir->type        = ITYPE_SYSTEM;
     ir->serializing = 1;
     ir->rd          = -1;   /* ecall writes no GPR */
-    ir->dnpc        = raise_intr(11, ir->pc, cpu->gpr[17]);
-    exception_priv_transfer();
+    ir->dnpc        = csr_trap(CAUSE_USER_ECALL + priv_level, ir->pc, 0);
+    (void)cpu;
 }
 
 static void ir_exec_mret(IR_Inst *ir, CPU_state *cpu)
@@ -1032,8 +1135,27 @@ static void ir_exec_mret(IR_Inst *ir, CPU_state *cpu)
     ir->type        = ITYPE_SYSTEM;
     ir->serializing = 1;
     ir->rd          = -1;
-    ir->dnpc        = read_csr(MEPC & 0xfff);
-    mret_priv_transfer();
+    ir->dnpc        = csr_mret();
+    (void)cpu;
+}
+
+static void ir_exec_sret(IR_Inst *ir, CPU_state *cpu)
+{
+    ir->type        = ITYPE_SYSTEM;
+    ir->serializing = 1;
+    ir->rd          = -1;
+    ir->dnpc        = csr_sret();
+    (void)cpu;
+}
+
+/* WFI and SFENCE.VMA: nothing to wait for and no TLB to flush */
+static void ir_exec_nop(IR_Inst *ir, CPU_state *cpu)
+{
+    ir->type        = ITYPE_SYSTEM;
+    ir->serializing = 1;
+    ir->rd          = -1;
+    ir->dnpc        = ir->snpc;
+    (void)cpu;
 }
 
 static void ir_exec_ebreak(IR_Inst *ir, CPU_state *cpu)
@@ -1041,9 +1163,11 @@ static void ir_exec_ebreak(IR_Inst *ir, CPU_state *cpu)
     ir->type        = ITYPE_SYSTEM;
     ir->serializing = 1;
     ir->rd          = -1;
-	ir->dnpc        = raise_intr(3, ir->pc, 0);
-	csr.mtval       = ir->pc;
-	exception_priv_transfer();
+    /* Ends the simulated program. The difftest reference does not come
+     * here: it raises the breakpoint exception itself (src/difftest.c). */
+    state           = NEMU_END;
+    ir->dnpc        = ir->snpc;
+    (void)cpu;
 }
 
 /* ── Misc ────────────────────────────────────────────────── */
