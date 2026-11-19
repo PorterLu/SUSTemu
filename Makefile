@@ -168,4 +168,4 @@ else
 	conf --syncconfig Kconfig
 endif
 
--include $(CSRCS:%.c=%.d) $(CXXSRCS:%.cc=%.d) $(ASRCS:%.S=%.d)
+-include $(OBJS:%.o=%.d)
