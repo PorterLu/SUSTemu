@@ -1,6 +1,7 @@
 /*
- * Reference model for differential testing of an RV64IMA hart with machine,
- * supervisor and user mode and Sv39 paging.
+ * Reference model for differential testing of an RV64IMAH hart with machine,
+ * supervisor and user mode, the hypervisor extension and Sv39 paging (Sv39x4
+ * for the guest-physical stage).
  *
  * The device under test (DUT) reports every instruction it retires. For each
  * of them difftest_step() executes instructions here until one retires as
@@ -9,10 +10,10 @@
  *
  * The reference only owns the RAM. It cannot know a value that depends on a
  * device or on the timing of the DUT (a load from a device, a counter, the
- * pending interrupt bits), so the caller passes the value the DUT wrote to the
- * destination register and the reference adopts it in exactly those cases.
- * Interrupts are asynchronous: the caller reports the one the DUT took with
- * difftest_raise_intr() and the reference checks that it was allowed.
+ * pending bits wired to devices), so the caller passes the value the DUT wrote
+ * to the destination register and the reference adopts it in exactly those
+ * cases. Interrupts are asynchronous: the caller reports the one the DUT took
+ * with difftest_raise_intr() and the reference checks that it was allowed.
  */
 #include <common.h>
 #include <cpu/ir.h>
@@ -31,6 +32,8 @@ struct DiffTrap {
 	word_t cause;
 	word_t epc;
 	word_t tval;
+	word_t tval2;	/* mtval2 or htval: a guest physical address >> 2 */
+	word_t tinst;	/* mtinst or htinst */
 };
 
 /* What the last retired instruction was and what it stored. */
@@ -49,44 +52,74 @@ static struct DiffStep last_step;
 static bool reservation;
 
 enum { ACCESS_FETCH, ACCESS_LOAD, ACCESS_STORE };
+/* Kinds of memory access by the hypervisor load and store instructions: as
+ * the guest in hstatus.SPVP, and for HLVX with execute in place of read
+ * permission. */
+enum { ACCESS_GUEST = 1, ACCESS_EXECUTE = 2 };
+/* mtinst/htinst when a guest-page fault hits the read of a VS-stage page
+ * table entry: a 64-bit load */
+#define TINST_PTE_READ 0x3000
+
+/* Why an address translation failed */
+struct Fault {
+	bool guest;	/* a guest-page fault of the guest-physical stage */
+	bool gva;	/* the address translated was a guest virtual one */
+	word_t tval2;
+	word_t tinst;
+};
 
 static bool in_ram(paddr_t addr, size_t size)
 {
 	return addr >= MBASE && size <= MSIZE && addr - MBASE <= MSIZE - size;
 }
 
-static void take_exception(word_t cause, word_t tval)
+static void take_trap(word_t cause, word_t tval, word_t tval2, word_t tinst, bool gva)
 {
 	if (trap_count < MAX_TRAPS) {
 		traps[trap_count].cause = cause;
 		traps[trap_count].epc = cpu.pc;
 		traps[trap_count].tval = tval;
+		traps[trap_count].tval2 = tval2;
+		traps[trap_count].tinst = tinst;
 	}
 	trap_count++;
-	cpu.pc = csr_trap(cause, cpu.pc, tval);
+	cpu.pc = csr_trap_guest(cause, cpu.pc, tval, tval2, tinst, gva);
 }
 
-/* Sv39 address translation. The accessed and dirty bits are never updated: a
- * leaf with A clear, or with D clear on a store, faults. */
-static bool translate(vaddr_t va, int access, paddr_t *pa)
+static void take_exception(word_t cause, word_t tval)
 {
-	uint64_t priv = priv_level;
-	if (access != ACCESS_FETCH && (csr.mstatus & MSTATUS_MPRV))
-		priv = (csr.mstatus & MSTATUS_MPP) >> 11;
+	take_trap(cause, tval, 0, 0, false);
+}
 
-	*pa = va;
-	if (priv == MACHINE || (csr.satp >> 60) != 8)
+/* An exception of a memory access at a virtual address: page faults carry
+ * what the translation reported, the others only the kind of the address. */
+static void take_fault(word_t cause, word_t va, const struct Fault *fault)
+{
+	if (fault->guest)
+		cause += CAUSE_FETCH_GUEST_PAGE_FAULT - CAUSE_FETCH_PAGE_FAULT;
+	take_trap(cause, va, fault->tval2, fault->tinst, fault->gva);
+}
+
+static uint64_t read_pte(paddr_t addr)
+{
+	return in_ram(addr, 8) ? host_read(guest_to_host(addr), 8) : 0;
+}
+
+/* Guest-physical stage: Sv39x4, a guest physical address of 41 bits behind a
+ * root table of 2048 entries. Every access counts as a user access. The reads
+ * of the VS-stage page tables (`implicit`) need read permission. */
+static bool translate_guest(paddr_t gpa, int access, int kind, bool implicit, paddr_t *pa)
+{
+	*pa = gpa;
+	if ((csr.hgatp >> 60) != 8)
 		return true;
-
-	/* bits 63:39 must all equal bit 38 */
-	if ((vaddr_t)(((int64_t)(va << 25)) >> 25) != va)
+	if (gpa >> 41)
 		return false;
 
-	paddr_t table = (csr.satp & 0xfffffffffffULL) << 12;
+	paddr_t table = (csr.hgatp & 0xfffffffffffULL) << 12;
 	for (int level = 2; level >= 0; level--) {
-		const paddr_t pte_addr = table + ((va >> (12 + 9 * level)) & 0x1ff) * 8;
-		const uint64_t pte = in_ram(pte_addr, 8)
-			? host_read(guest_to_host(pte_addr), 8) : 0;
+		const uint64_t index = (gpa >> (12 + 9 * level)) & (level == 2 ? 0x7ff : 0x1ff);
+		const uint64_t pte = read_pte(table + index * 8);
 		const bool r = pte & 2, w = pte & 4, x = pte & 8, u = pte & 16;
 		const uint64_t ppn = (pte >> 10) & 0xfffffffffffULL;
 
@@ -97,30 +130,130 @@ static bool translate(vaddr_t va, int access, paddr_t *pa)
 			continue;
 		}
 
-		/* a superpage must be aligned */
 		if (level && (ppn & ((1ULL << (9 * level)) - 1)))
 			return false;
-		if (priv == USER && !u)
+		if (!u)
 			return false;
-		/* supervisor reaches user pages only for data and with SUM */
-		if (priv == SUPERVISOR && u &&
-		    (access == ACCESS_FETCH || !(csr.mstatus & MSTATUS_SUM)))
+		if (implicit) {
+			if (!r)
+				return false;
+		} else if (access == ACCESS_FETCH || (kind & ACCESS_EXECUTE)) {
+			if (!x)
+				return false;
+		} else if (access == ACCESS_LOAD) {
+			if (!(r || (x && (csr.mstatus & MSTATUS_MXR))))
+				return false;
+		} else if (!w) {
 			return false;
-		if (access == ACCESS_FETCH && !x)
-			return false;
-		if (access == ACCESS_LOAD &&
-		    !(r || (x && (csr.mstatus & MSTATUS_MXR))))
-			return false;
-		if (access == ACCESS_STORE && !w)
-			return false;
-		if (!(pte & 0x40) || (access == ACCESS_STORE && !(pte & 0x80)))
+		}
+		if (!(pte & 0x40) || (access == ACCESS_STORE && !implicit && !(pte & 0x80)))
 			return false;
 
 		const uint64_t offset_mask = (1ULL << (12 + 9 * level)) - 1;
-		*pa = ((ppn << 12) & ~offset_mask) | (va & offset_mask);
+		*pa = ((ppn << 12) & ~offset_mask) | (gpa & offset_mask);
 		return true;
 	}
 	return false;
+}
+
+/* Address translation of an access in the current mode. Sv39 by satp, or for
+ * a guest Sv39 by vsatp followed by the guest-physical stage, which also
+ * translates the address of every VS-stage page table entry. The accessed and
+ * dirty bits are never updated: a leaf with A clear, or with D clear on a
+ * store, faults. */
+static bool translate(vaddr_t va, int access, int kind, paddr_t *pa, struct Fault *fault)
+{
+	uint64_t priv = priv_level;
+	bool virt = virt_mode;
+
+	if (kind & ACCESS_GUEST) {
+		priv = (csr.hstatus & HSTATUS_SPVP) ? SUPERVISOR : USER;
+		virt = true;
+	} else if (access != ACCESS_FETCH && (csr.mstatus & MSTATUS_MPRV)) {
+		priv = (csr.mstatus & MSTATUS_MPP) >> 11;
+		virt = priv != MACHINE && (csr.mstatus & MSTATUS_MPV);
+	}
+
+	const word_t atp = virt ? csr.vsatp : csr.satp;
+	const word_t status = virt ? csr.vsstatus : csr.mstatus;
+	const bool sum = status & MSTATUS_SUM;
+	/* sstatus.MXR of the hypervisor also applies to the pages of a guest */
+	const bool mxr = (status | csr.mstatus) & MSTATUS_MXR;
+
+	fault->guest = false;
+	fault->gva = virt;
+	fault->tval2 = 0;
+	fault->tinst = 0;
+	*pa = va;
+	if (priv == MACHINE)
+		return true;
+
+	paddr_t gpa = va;
+	if ((atp >> 60) == 8) {
+		bool found = false;
+		paddr_t table = (atp & 0xfffffffffffULL) << 12;
+
+		/* bits 63:39 must all equal bit 38 */
+		if ((vaddr_t)(((int64_t)(va << 25)) >> 25) != va)
+			return false;
+
+		for (int level = 2; level >= 0 && !found; level--) {
+			const paddr_t pte_gpa = table + ((va >> (12 + 9 * level)) & 0x1ff) * 8;
+			paddr_t pte_addr = pte_gpa;
+
+			if (virt && !translate_guest(pte_gpa, ACCESS_LOAD, 0, true, &pte_addr)) {
+				fault->guest = true;
+				fault->tval2 = pte_gpa >> 2;
+				fault->tinst = TINST_PTE_READ;
+				return false;
+			}
+
+			const uint64_t pte = read_pte(pte_addr);
+			const bool r = pte & 2, w = pte & 4, x = pte & 8, u = pte & 16;
+			const uint64_t ppn = (pte >> 10) & 0xfffffffffffULL;
+
+			if (!(pte & 1) || (!r && w))
+				return false;
+			if (!r && !x) {
+				table = ppn << 12;
+				continue;
+			}
+
+			/* a superpage must be aligned */
+			if (level && (ppn & ((1ULL << (9 * level)) - 1)))
+				return false;
+			if (priv == USER && !u)
+				return false;
+			/* supervisor reaches user pages only for data and with SUM */
+			if (priv == SUPERVISOR && u && (access == ACCESS_FETCH || !sum))
+				return false;
+			if (access == ACCESS_FETCH || (kind & ACCESS_EXECUTE)) {
+				if (!x)
+					return false;
+			} else if (access == ACCESS_LOAD) {
+				if (!(r || (x && mxr)))
+					return false;
+			} else if (!w) {
+				return false;
+			}
+			if (!(pte & 0x40) || (access == ACCESS_STORE && !(pte & 0x80)))
+				return false;
+
+			const uint64_t offset_mask = (1ULL << (12 + 9 * level)) - 1;
+			gpa = ((ppn << 12) & ~offset_mask) | (va & offset_mask);
+			found = true;
+		}
+		if (!found)
+			return false;
+	}
+
+	*pa = gpa;
+	if (virt && !translate_guest(gpa, access, kind, false, pa)) {
+		fault->guest = true;
+		fault->tval2 = gpa >> 2;
+		return false;
+	}
+	return true;
 }
 
 static word_t sign_extend(word_t value, int width)
@@ -150,60 +283,75 @@ static void store(paddr_t pa, int width, word_t value)
 	reservation = false;
 }
 
+/* Load `width` bytes at va into rd. A load from a device returns the value
+ * of the DUT. */
+static bool load(vaddr_t va, int width, bool is_signed, int kind, int rd, word_t dut_value)
+{
+	struct Fault fault;
+	paddr_t pa;
+
+	if (va & (width - 1)) {
+		translate(va, ACCESS_LOAD, kind, &pa, &fault);
+		take_trap(CAUSE_MISALIGNED_LOAD, va, 0, 0, fault.gva);
+		return false;
+	}
+	if (!translate(va, ACCESS_LOAD, kind, &pa, &fault)) {
+		take_fault(CAUSE_LOAD_PAGE_FAULT, va, &fault);
+		return false;
+	}
+
+	word_t value = dut_value;
+	if (in_ram(pa, width)) {
+		value = host_read(guest_to_host(pa), width);
+		if (is_signed)
+			value = sign_extend(value, width);
+	}
+	set_gpr(rd, value);
+	return true;
+}
+
+static bool store_at(vaddr_t va, int width, int kind, word_t value)
+{
+	struct Fault fault;
+	paddr_t pa;
+
+	if (va & (width - 1)) {
+		translate(va, ACCESS_STORE, kind, &pa, &fault);
+		take_trap(CAUSE_MISALIGNED_STORE, va, 0, 0, fault.gva);
+		return false;
+	}
+	if (!translate(va, ACCESS_STORE, kind, &pa, &fault)) {
+		take_fault(CAUSE_STORE_PAGE_FAULT, va, &fault);
+		return false;
+	}
+	store(pa, width, value);
+	return true;
+}
+
 static bool exec_load(uint32_t raw, word_t dut_value)
 {
 	static const int widths[8] = {1, 2, 4, 8, 1, 2, 4, 0};
 	const int funct3 = (raw >> 12) & 7;
-	const int width = widths[funct3];
 	const vaddr_t va = cpu.gpr[(raw >> 15) & 0x1f] + (word_t)((int32_t)raw >> 20);
-	paddr_t pa;
 
-	if (!width) {
+	if (!widths[funct3]) {
 		take_exception(CAUSE_ILLEGAL_INST, raw);
 		return false;
 	}
-	if (va & (width - 1)) {
-		take_exception(CAUSE_MISALIGNED_LOAD, va);
-		return false;
-	}
-	if (!translate(va, ACCESS_LOAD, &pa)) {
-		take_exception(CAUSE_LOAD_PAGE_FAULT, va);
-		return false;
-	}
-
-	word_t value = dut_value;	/* a device read: only the DUT knows */
-	if (in_ram(pa, width)) {
-		value = host_read(guest_to_host(pa), width);
-		if (funct3 < 4)
-			value = sign_extend(value, width);
-	}
-	set_gpr((raw >> 7) & 0x1f, value);
-	return true;
+	return load(va, widths[funct3], funct3 < 4, 0, (raw >> 7) & 0x1f, dut_value);
 }
 
 static bool exec_store(uint32_t raw)
 {
 	const int funct3 = (raw >> 12) & 7;
-	const int width = 1 << funct3;
 	const word_t offset = (word_t)(((int32_t)raw >> 25) << 5) | ((raw >> 7) & 0x1f);
 	const vaddr_t va = cpu.gpr[(raw >> 15) & 0x1f] + offset;
-	paddr_t pa;
 
 	if (funct3 > 3) {
 		take_exception(CAUSE_ILLEGAL_INST, raw);
 		return false;
 	}
-	if (va & (width - 1)) {
-		take_exception(CAUSE_MISALIGNED_STORE, va);
-		return false;
-	}
-	if (!translate(va, ACCESS_STORE, &pa)) {
-		take_exception(CAUSE_STORE_PAGE_FAULT, va);
-		return false;
-	}
-
-	store(pa, width, cpu.gpr[(raw >> 20) & 0x1f]);
-	return true;
+	return store_at(va, 1 << funct3, 0, cpu.gpr[(raw >> 20) & 0x1f]);
 }
 
 static bool exec_atomic(uint32_t raw, word_t dut_value)
@@ -215,6 +363,7 @@ static bool exec_atomic(uint32_t raw, word_t dut_value)
 	const vaddr_t va = cpu.gpr[(raw >> 15) & 0x1f];
 	const word_t src = cpu.gpr[(raw >> 20) & 0x1f];
 	const bool is_lr = funct5 == 0x02;
+	struct Fault fault;
 	paddr_t pa;
 
 	switch (funct5) {
@@ -233,13 +382,16 @@ static bool exec_atomic(uint32_t raw, word_t dut_value)
 		take_exception(CAUSE_ILLEGAL_INST, raw);
 		return false;
 	}
+	/* SC and the AMOs are checked as stores even when they do not write */
+	const int access = is_lr ? ACCESS_LOAD : ACCESS_STORE;
 	if (va & (width - 1)) {
-		take_exception(is_lr ? CAUSE_MISALIGNED_LOAD : CAUSE_MISALIGNED_STORE, va);
+		translate(va, access, 0, &pa, &fault);
+		take_trap(is_lr ? CAUSE_MISALIGNED_LOAD : CAUSE_MISALIGNED_STORE, va, 0, 0,
+			  fault.gva);
 		return false;
 	}
-	/* SC and the AMOs are checked as stores even when they do not write */
-	if (!translate(va, is_lr ? ACCESS_LOAD : ACCESS_STORE, &pa)) {
-		take_exception(is_lr ? CAUSE_LOAD_PAGE_FAULT : CAUSE_STORE_PAGE_FAULT, va);
+	if (!translate(va, access, 0, &pa, &fault)) {
+		take_fault(is_lr ? CAUSE_LOAD_PAGE_FAULT : CAUSE_STORE_PAGE_FAULT, va, &fault);
 		return false;
 	}
 
@@ -295,12 +447,100 @@ static bool exec_atomic(uint32_t raw, word_t dut_value)
 	return true;
 }
 
-/* CSRs whose value depends on the timing of the DUT or on its interrupt
- * lines: a read returns what the DUT returned. */
-static bool csr_follows_dut(uint32_t no)
+/* The bits of a CSR that depend on the timing of the DUT or on its interrupt
+ * lines: a read returns them as the DUT returned them. */
+static word_t csr_dut_bits(uint32_t no)
 {
-	return no == MIP || no == SIP || no == MCYCLE || no == MINSTRET ||
-	       no == CYCLE || no == INSTRET;
+	switch (no) {
+	case MIP:
+		return MIP_MSIP | MIP_MTIP | MIP_MEIP;
+	case MCYCLE: case MINSTRET: case CYCLE: case INSTRET:
+		return ~0ULL;
+	}
+	return 0;
+}
+
+/* The privileged instructions without operands. Returns 0 when the current
+ * mode may execute one, or the cause of the exception it raises instead: a
+ * guest gets a virtual-instruction exception where HS mode would succeed. */
+static int system_check(uint32_t raw)
+{
+	const bool user = priv_level == USER, hs = priv_level == SUPERVISOR && !virt_mode;
+	const bool tw = csr.mstatus & MSTATUS_TW;
+
+	if (raw == 0x30200073)				/* MRET */
+		return priv_level == MACHINE ? 0 : CAUSE_ILLEGAL_INST;
+	if (raw == 0x10200073) {			/* SRET */
+		if (virt_mode)
+			return user || (csr.hstatus & HSTATUS_VTSR) ? CAUSE_VIRTUAL_INST : 0;
+		return user || (hs && (csr.mstatus & MSTATUS_TSR)) ? CAUSE_ILLEGAL_INST : 0;
+	}
+	if (raw == 0x10500073) {			/* WFI */
+		if (priv_level == MACHINE)
+			return 0;
+		if (tw)
+			return CAUSE_ILLEGAL_INST;
+		if (virt_mode)
+			return user || (csr.hstatus & HSTATUS_VTW) ? CAUSE_VIRTUAL_INST : 0;
+		return user ? CAUSE_ILLEGAL_INST : 0;
+	}
+	if ((raw & 0xfe007fff) == 0x12000073) {		/* SFENCE.VMA */
+		if (virt_mode)
+			return user || (csr.hstatus & HSTATUS_VTVM) ? CAUSE_VIRTUAL_INST : 0;
+		return user || (hs && (csr.mstatus & MSTATUS_TVM)) ? CAUSE_ILLEGAL_INST : 0;
+	}
+	if ((raw & 0xfe007fff) == 0x22000073) {		/* HFENCE.VVMA */
+		if (virt_mode)
+			return CAUSE_VIRTUAL_INST;
+		return user ? CAUSE_ILLEGAL_INST : 0;
+	}
+	if ((raw & 0xfe007fff) == 0x62000073) {		/* HFENCE.GVMA */
+		if (virt_mode)
+			return CAUSE_VIRTUAL_INST;
+		return user || (hs && (csr.mstatus & MSTATUS_TVM)) ? CAUSE_ILLEGAL_INST : 0;
+	}
+	return CAUSE_ILLEGAL_INST;
+}
+
+/* HLV, HLVX and HSV: a load or store at rs1 as the guest in hstatus.SPVP */
+static bool exec_hypervisor_access(uint32_t raw, word_t dut_value)
+{
+	const int funct7 = raw >> 25;
+	const int rs2 = (raw >> 20) & 0x1f;
+	const int rd = (raw >> 7) & 0x1f;
+	const vaddr_t va = cpu.gpr[(raw >> 15) & 0x1f];
+	const int width = 1 << ((funct7 >> 1) & 3);
+	const bool is_store = funct7 & 1;
+	bool valid;
+
+	if ((funct7 & 0x78) != 0x30)
+		valid = false;
+	else if (is_store)
+		valid = rd == 0;
+	else if (rs2 == 0)
+		valid = true;				/* HLV.B/H/W/D */
+	else if (rs2 == 1)
+		valid = width < 8;			/* HLV.BU/HU/WU */
+	else
+		valid = rs2 == 3 && (width == 2 || width == 4);	/* HLVX.HU/WU */
+
+	if (!valid) {
+		take_exception(CAUSE_ILLEGAL_INST, raw);
+		return false;
+	}
+	if (virt_mode) {
+		take_exception(CAUSE_VIRTUAL_INST, raw);
+		return false;
+	}
+	if (priv_level == USER && !(csr.hstatus & HSTATUS_HU)) {
+		take_exception(CAUSE_ILLEGAL_INST, raw);
+		return false;
+	}
+
+	if (is_store)
+		return store_at(va, width, ACCESS_GUEST, cpu.gpr[rs2]);
+	return load(va, width, rs2 == 0, ACCESS_GUEST | (rs2 == 3 ? ACCESS_EXECUTE : 0),
+		    rd, dut_value);
 }
 
 static bool exec_system(uint32_t raw, word_t dut_value)
@@ -312,53 +552,58 @@ static bool exec_system(uint32_t raw, word_t dut_value)
 
 	if (funct3 == 0) {
 		if (raw == 0x00000073) {		/* ECALL */
-			take_exception(CAUSE_USER_ECALL + priv_level, 0);
+			take_exception(priv_level == MACHINE ? CAUSE_MACHINE_ECALL
+				       : priv_level == USER ? CAUSE_USER_ECALL
+				       : virt_mode ? CAUSE_VIRTUAL_SUPERVISOR_ECALL
+				       : CAUSE_SUPERVISOR_ECALL, 0);
 			return false;
 		}
 		if (raw == 0x00100073) {		/* EBREAK */
-			take_exception(CAUSE_BREAKPOINT, cpu.pc);
+			take_trap(CAUSE_BREAKPOINT, cpu.pc, 0, 0, virt_mode);
 			return false;
 		}
-		if (raw == 0x30200073 && priv_level == MACHINE) {
+
+		const int cause = system_check(raw);
+		if (cause) {
+			take_exception(cause, raw);
+			return false;
+		}
+		if (raw == 0x30200073) {
 			cpu.pc = csr_mret();
 			return true;
 		}
-		if (raw == 0x10200073 && priv_level >= SUPERVISOR) {
+		if (raw == 0x10200073) {
 			cpu.pc = csr_sret();
 			return true;
 		}
-		/* WFI, and SFENCE.VMA outside user mode: nothing to do here */
-		if (raw == 0x10500073 ||
-		    ((raw & 0xfe007fff) == 0x12000073 && priv_level >= SUPERVISOR)) {
-			cpu.pc += 4;
-			return true;
-		}
-		take_exception(CAUSE_ILLEGAL_INST, raw);
-		return false;
+		/* WFI and the fences of the translation caches: nothing to do */
+		cpu.pc += 4;
+		return true;
 	}
 	if (funct3 == 4) {
-		take_exception(CAUSE_ILLEGAL_INST, raw);
-		return false;
+		if (!exec_hypervisor_access(raw, dut_value))
+			return false;
+		cpu.pc += 4;
+		return true;
 	}
 
 	const int op = funct3 & 3;			/* 1 write, 2 set, 3 clear */
 	const word_t operand = (funct3 & 4) ? (word_t)rs1 : cpu.gpr[rs1];
 	const bool writes = op == 1 || rs1 != 0;
+	const int cause = csr_check(no, writes);
 	word_t old;
 
-	if (!csr_read(no, &old)) {
-		take_exception(CAUSE_ILLEGAL_INST, raw);
+	if (cause || !csr_read(no, &old)) {
+		take_exception(cause ? cause : CAUSE_ILLEGAL_INST, raw);
 		return false;
 	}
 	if (writes) {
 		const word_t value = op == 1 ? operand
 				   : op == 2 ? (old | operand) : (old & ~operand);
-		if (!csr_write(no, value)) {
-			take_exception(CAUSE_ILLEGAL_INST, raw);
-			return false;
-		}
+		csr_write(no, value);
 	}
-	set_gpr(rd, csr_follows_dut(no) ? dut_value : old);
+	const word_t dut_bits = csr_dut_bits(no);
+	set_gpr(rd, (old & ~dut_bits) | (dut_value & dut_bits));
 	cpu.pc += 4;
 	return true;
 }
@@ -368,10 +613,11 @@ static bool exec_system(uint32_t raw, word_t dut_value)
 static bool execute_one(word_t dut_value)
 {
 	const vaddr_t pc = cpu.pc;
+	struct Fault fault;
 	paddr_t physical_pc;
 
-	if (!translate(pc, ACCESS_FETCH, &physical_pc)) {
-		take_exception(CAUSE_FETCH_PAGE_FAULT, pc);
+	if (!translate(pc, ACCESS_FETCH, 0, &physical_pc, &fault)) {
+		take_fault(CAUSE_FETCH_PAGE_FAULT, pc, &fault);
 		return false;
 	}
 	/* a fetch outside the RAM reads zero, which is not an instruction */
@@ -421,7 +667,7 @@ static bool execute_one(word_t dut_value)
 	ir_execute(&ir, &cpu);
 	/* a taken jump or branch to a misaligned target traps on the jump */
 	if (ir.dnpc & 3) {
-		take_exception(CAUSE_MISALIGNED_FETCH, ir.dnpc);
+		take_trap(CAUSE_MISALIGNED_FETCH, ir.dnpc, 0, 0, virt_mode);
 		return false;
 	}
 	ir_writeback(&ir, &cpu);
@@ -475,36 +721,34 @@ int difftest_get_trap(int index, void *trap)
 	return 0;
 }
 
-/* The DUT took interrupt `code`. hw_pending holds the machine-level pending
- * bits (MSIP, MTIP, MEIP), which are wired to devices and unknown here.
- * Returns non-zero when the reference state does not allow that interrupt:
- * 1 not pending and enabled, 2 a higher priority interrupt should be taken. */
-int difftest_raise_intr(uint64_t code, uint64_t hw_pending)
+static word_t pending_bits(uint64_t hw_pending)
 {
 	const word_t machine_bits = MIP_MSIP | MIP_MTIP | MIP_MEIP;
-	const word_t pending = ((csr.mip & ~machine_bits) |
-				(hw_pending & machine_bits)) & csr.mie;
-	const bool m_enabled = priv_level < MACHINE || (csr.mstatus & MSTATUS_MIE);
-	const bool s_enabled = priv_level < SUPERVISOR ||
-			       (priv_level == SUPERVISOR && (csr.mstatus & MSTATUS_SIE));
-	const word_t allowed = (m_enabled ? pending & ~csr.mideleg : 0) |
-			       (s_enabled ? pending & csr.mideleg : 0);
-	static const int priority[] = {11, 3, 7, 9, 1, 5};
-	int result = 0;
+	return (csr.mip & ~machine_bits) | (hw_pending & machine_bits);
+}
 
-	if (code > 63 || !((allowed >> code) & 1)) {
-		result = 1;
-	} else {
-		for (unsigned i = 0; i < sizeof(priority) / sizeof(priority[0]); i++) {
-			if ((allowed >> priority[i]) & 1) {
-				if ((uint64_t)priority[i] != code)
-					result = 2;
-				break;
-			}
-		}
+/* The cause code of the interrupt the reference would take now, or -1.
+ * hw_pending holds the machine-level pending bits (MSIP, MTIP, MEIP), which
+ * are wired to devices and unknown here. */
+int difftest_pending_intr(uint64_t hw_pending)
+{
+	const int number = csr_pending_interrupt(pending_bits(hw_pending));
+	return number < 0 ? -1 : csr_interrupt_code(number);
+}
+
+/* The DUT took an interrupt and stored the cause code `code`. Returns non-zero
+ * when the reference state does not allow that: 1 no interrupt is pending and
+ * enabled, 2 another one has priority. */
+int difftest_raise_intr(uint64_t code, uint64_t hw_pending)
+{
+	const int number = csr_pending_interrupt(pending_bits(hw_pending));
+
+	if (number < 0) {
+		cpu.pc = csr_trap(CAUSE_INTERRUPT | code, cpu.pc, 0);
+		return 1;
 	}
-
-	cpu.pc = csr_trap(CAUSE_INTERRUPT | code, cpu.pc, 0);
+	const int result = (uint64_t)csr_interrupt_code(number) == code ? 0 : 2;
+	cpu.pc = csr_trap(CAUSE_INTERRUPT | number, cpu.pc, 0);
 	return result;
 }
 
@@ -531,20 +775,24 @@ void difftest_memcpy(paddr_t addr, void *data, size_t size, int to_reference)
 		memcpy(data, guest_to_host(addr), size);
 }
 
-/* Value of a CSR regardless of the current privilege, for mismatch reports */
+/* Value of a CSR regardless of the current mode, for mismatch reports */
 uint64_t difftest_get_csr(uint32_t no)
 {
 	const uint64_t saved = priv_level;
+	const bool saved_virt = virt_mode;
 	word_t value = 0;
 
 	priv_level = MACHINE;
+	virt_mode = false;
 	if (no == MCYCLE || no == MINSTRET || !csr_read(no, &value))
 		value = 0;
 	priv_level = saved;
+	virt_mode = saved_virt;
 	return value;
 }
 
+/* The privilege level, with bit 2 set in VS and VU mode */
 uint64_t difftest_get_priv(void)
 {
-	return priv_level;
+	return priv_level | (virt_mode ? 4 : 0);
 }

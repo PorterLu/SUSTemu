@@ -7,6 +7,7 @@
 
 CSR csr;
 uint64_t priv_level = 3;
+bool virt_mode = false;
 uint64_t g_sim_cycles  = 0;
 uint64_t g_sim_instret = 0;
 int      g_current_hartid = 0;
@@ -15,22 +16,37 @@ word_t pmpaddr[PMP_NUMBER_IN_SUSTEMU];
 uint8_t pmp_on_count = 0;
 bool csr_hide_custom_counters = false;
 
-/* RV64IMA with supervisor and user mode */
-#define MISA_VALUE 0x8000000000141101ULL
+/* RV64IMAH with supervisor and user mode */
+#define MISA_VALUE 0x8000000000141181ULL
 
-/* writable bits of mstatus and the part of it that sstatus shows */
+/* writable bits of mstatus and the part of it that sstatus shows; vsstatus
+ * has the bits of sstatus */
 #define MSTATUS_WMASK (MSTATUS_SIE | MSTATUS_MIE | MSTATUS_SPIE | MSTATUS_MPIE | \
 		       MSTATUS_SPP | MSTATUS_MPP | MSTATUS_MPRV | MSTATUS_SUM | \
-		       MSTATUS_MXR)
+		       MSTATUS_MXR | MSTATUS_TVM | MSTATUS_TW | MSTATUS_TSR | \
+		       MSTATUS_GVA | MSTATUS_MPV)
 #define SSTATUS_WMASK (MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_SUM | \
 		       MSTATUS_MXR)
-/* UXL = SXL = 2: both lower modes are 64 bit */
+#define HSTATUS_WMASK (HSTATUS_GVA | HSTATUS_SPV | HSTATUS_SPVP | HSTATUS_HU | \
+		       HSTATUS_VTVM | HSTATUS_VTW | HSTATUS_VTSR)
+/* UXL = SXL = 2: both lower modes are 64 bit, and so is VS mode (VSXL) */
 #define MSTATUS_XL    0x0000000a00000000ULL
+#define HSTATUS_VSXL  0x0000000200000000ULL
 
 #define S_INTERRUPTS  (MIP_SSIP | MIP_STIP | MIP_SEIP)
 #define M_INTERRUPTS  (MIP_MSIP | MIP_MTIP | MIP_MEIP)
+/* The VS-level interrupts are always delegated to HS mode: these bits of
+ * mideleg read as one. There are no guest external interrupts (GEILEN = 0). */
+#define VS_INTERRUPTS (MIP_VSSIP | MIP_VSTIP | MIP_VSEIP)
 /* exceptions that can be delegated: everything but an ecall from M-mode */
-#define MEDELEG_WMASK 0xf7ffULL
+#define MEDELEG_WMASK 0xf0f7ffULL
+/* HS mode keeps its own ecalls, those of VS mode, guest-page faults and
+ * virtual-instruction exceptions */
+#define HEDELEG_WMASK 0xb1ffULL
+/* Sv39x4 or bare, no VMID bits; the root page table is 16 KiB */
+#define HGATP_PPN     0x00000ffffffffffcULL
+/* interrupt and exception code of a cause register */
+#define CAUSE_WMASK   (CAUSE_INTERRUPT | 0x1f)
 
 void csr_reset(void)
 {
@@ -39,6 +55,7 @@ void csr_reset(void)
 	memset(pmpaddr, 0, sizeof(pmpaddr));
 	pmp_on_count = 0;
 	priv_level = MACHINE;
+	virt_mode = false;
 }
 
 void mret_priv_transfer(){
@@ -89,9 +106,28 @@ static bool csr_implemented(uint32_t no)
 	case MCONTEXT: case MCYCLE: case MINSTRET:
 	case MVENDORID: case MARCHID: case MIMPID: case MHARTID: case MCONFIGPTR:
 	case CYCLE: case INSTRET:
+	case HSTATUS: case HEDELEG: case HIDELEG: case HIE: case HCOUNTEREN:
+	case HGEIE: case HENVCFG: case HTVAL: case HIP: case HVIP: case HTINST:
+	case HGATP: case HGEIP: case MTINST: case MTVAL2:
+	case VSSTATUS: case VSIE: case VSTVEC: case VSSCRATCH: case VSEPC:
+	case VSCAUSE: case VSTVAL: case VSIP: case VSATP:
 		return true;
 	}
 	return false;
+}
+
+/* In VS and VU mode these supervisor CSRs stand for their VS copies, which
+ * have the same number with bits 9:8 changed from 1 to 2. */
+static uint32_t csr_target(uint32_t no)
+{
+	if (!virt_mode)
+		return no;
+	switch (no) {
+	case SSTATUS: case SIE: case STVEC: case SSCRATCH: case SEPC:
+	case SCAUSE: case STVAL: case SIP: case SATP:
+		return no ^ 0x300;
+	}
+	return no;
 }
 
 static bool csr_read_only(uint32_t no)
@@ -99,31 +135,58 @@ static bool csr_read_only(uint32_t no)
 	return ((no >> 10) & 3) == 3;
 }
 
+int csr_check(uint32_t no, bool is_write)
+{
+	/* bits 9:8 of the number: 0 user, 1 supervisor, 2 hypervisor and VS, 3
+	 * machine. HS mode is the level that reaches the hypervisor CSRs. */
+	const uint32_t level = (no >> 8) & 3;
+
+	if (!csr_implemented(csr_target(no)))
+		return CAUSE_ILLEGAL_INST;
+	if (is_write && csr_read_only(no))
+		return CAUSE_ILLEGAL_INST;
+
+	if (!virt_mode) {
+		const uint32_t have = priv_level == SUPERVISOR ? 2 : priv_level;
+		if (level > have)
+			return CAUSE_ILLEGAL_INST;
+		if (priv_level == SUPERVISOR && (csr.mstatus & MSTATUS_TVM) &&
+		    (no == SATP || no == HGATP))
+			return CAUSE_ILLEGAL_INST;
+	} else {
+		/* what HS mode could do is a virtual-instruction exception here */
+		if (level == 3)
+			return CAUSE_ILLEGAL_INST;
+		if (level == 2 || (level == 1 && priv_level == USER))
+			return CAUSE_VIRTUAL_INST;
+		if (no == SATP && (csr.hstatus & HSTATUS_VTVM))
+			return CAUSE_VIRTUAL_INST;
+	}
+
+	/* the unprivileged counters are gated by mcounteren, by hcounteren for
+	 * a guest and by scounteren for user mode */
+	if (no >= CYCLE && no <= 0xc1f && priv_level < MACHINE) {
+		const int bit = no - CYCLE;
+		if (!((csr.mcounteren >> bit) & 1))
+			return CAUSE_ILLEGAL_INST;
+		if (virt_mode && !((csr.hcounteren >> bit) & 1))
+			return CAUSE_VIRTUAL_INST;
+		if (priv_level == USER && !((csr.scounteren >> bit) & 1))
+			return CAUSE_ILLEGAL_INST;
+	}
+	return 0;
+}
+
 static bool csr_accessible(uint32_t no, bool is_write)
 {
-	if (!csr_implemented(no))
-		return false;
-	if (priv_level < ((no >> 8) & 3))
-		return false;
-	if (is_write && csr_read_only(no))
-		return false;
-	/* the unprivileged counters are gated by mcounteren and scounteren */
-	if (no >= CYCLE && no <= 0xc1f) {
-		word_t enable = ~0ULL;
-		if (priv_level < MACHINE)
-			enable &= csr.mcounteren;
-		if (priv_level < SUPERVISOR)
-			enable &= csr.scounteren;
-		if (!((enable >> (no - CYCLE)) & 1))
-			return false;
-	}
-	return true;
+	return csr_check(no, is_write) == 0;
 }
 
 bool csr_read(uint32_t no, word_t *value)
 {
 	if (!csr_accessible(no, false))
 		return false;
+	no = csr_target(no);
 
 	if (no >= PMPCFG0 && no <= PMPCFG3) {
 		*value = csr.pmpcfg[no - PMPCFG0];
@@ -148,11 +211,34 @@ bool csr_read(uint32_t no, word_t *value)
 			       (MSTATUS_XL & MSTATUS_UXL); break;
 	case MISA: *value = MISA_VALUE; break;
 	case MEDELEG: *value = csr.medeleg; break;
-	case MIDELEG: *value = csr.mideleg; break;
+	case MIDELEG: *value = csr.mideleg | VS_INTERRUPTS; break;
 	case MIE: *value = csr.mie; break;
 	case SIE: *value = csr.mie & csr.mideleg; break;
+	case HIE: *value = csr.mie & VS_INTERRUPTS; break;
+	case VSIE: *value = (csr.mie & csr.hideleg) >> 1; break;
 	case MIP: *value = csr.mip; break;
 	case SIP: *value = csr.mip & csr.mideleg; break;
+	case HIP: case HVIP: *value = csr.mip & VS_INTERRUPTS; break;
+	case VSIP: *value = (csr.mip & csr.hideleg) >> 1; break;
+	case HSTATUS: *value = (csr.hstatus & HSTATUS_WMASK) | HSTATUS_VSXL; break;
+	case HEDELEG: *value = csr.hedeleg; break;
+	case HIDELEG: *value = csr.hideleg; break;
+	case HCOUNTEREN: *value = csr.hcounteren; break;
+	case HENVCFG: *value = csr.henvcfg; break;
+	case HTVAL: *value = csr.htval; break;
+	case HTINST: *value = csr.htinst; break;
+	case HGATP: *value = csr.hgatp; break;
+	case HGEIE: case HGEIP: *value = 0; break;
+	case MTVAL2: *value = csr.mtval2; break;
+	case MTINST: *value = csr.mtinst; break;
+	case VSSTATUS: *value = (csr.vsstatus & SSTATUS_WMASK) |
+				(MSTATUS_XL & MSTATUS_UXL); break;
+	case VSTVEC: *value = csr.vstvec; break;
+	case VSSCRATCH: *value = csr.vsscratch; break;
+	case VSEPC: *value = csr.vsepc; break;
+	case VSCAUSE: *value = csr.vscause; break;
+	case VSTVAL: *value = csr.vstval; break;
+	case VSATP: *value = csr.vsatp; break;
 	case MTVEC: *value = csr.mtvec; break;
 	case STVEC: *value = csr.stvec; break;
 	case MCOUNTERN: *value = csr.mcounteren; break;
@@ -191,6 +277,7 @@ bool csr_write(uint32_t no, word_t data)
 {
 	if (!csr_accessible(no, true))
 		return false;
+	no = csr_target(no);
 
 	if (no >= PMPCFG0 && no <= PMPCFG3) {
 		csr.pmpcfg[no - PMPCFG0] = data;
@@ -228,17 +315,65 @@ bool csr_write(uint32_t no, word_t data)
 		break;
 	case MEDELEG: csr.medeleg = data & MEDELEG_WMASK; break;
 	case MIDELEG: csr.mideleg = data & S_INTERRUPTS; break;
-	case MIE: csr.mie = data & (S_INTERRUPTS | M_INTERRUPTS); break;
+	case MIE:
+		csr.mie = data & (S_INTERRUPTS | M_INTERRUPTS | VS_INTERRUPTS);
+		break;
 	case SIE:
 		csr.mie = (csr.mie & ~csr.mideleg) | (data & csr.mideleg);
 		break;
-	/* the machine-level pending bits are driven by the platform */
+	case HIE:
+		csr.mie = (csr.mie & ~VS_INTERRUPTS) | (data & VS_INTERRUPTS);
+		break;
+	case VSIE:
+		csr.mie = (csr.mie & ~csr.hideleg) | ((data << 1) & csr.hideleg);
+		break;
+	/* the machine-level pending bits are driven by the platform; of the
+	 * VS-level bits only the software interrupt is writable here */
 	case MIP:
-		csr.mip = (csr.mip & ~S_INTERRUPTS) | (data & S_INTERRUPTS);
+		csr.mip = (csr.mip & ~(S_INTERRUPTS | MIP_VSSIP)) |
+			  (data & (S_INTERRUPTS | MIP_VSSIP));
 		break;
 	case SIP:
 		csr.mip = (csr.mip & ~(MIP_SSIP & csr.mideleg)) |
 			  (data & MIP_SSIP & csr.mideleg);
+		break;
+	case HIP:
+		csr.mip = (csr.mip & ~MIP_VSSIP) | (data & MIP_VSSIP);
+		break;
+	/* hvip is how a hypervisor raises the interrupts of its guest */
+	case HVIP:
+		csr.mip = (csr.mip & ~VS_INTERRUPTS) | (data & VS_INTERRUPTS);
+		break;
+	case VSIP:
+		csr.mip = (csr.mip & ~(MIP_VSSIP & csr.hideleg)) |
+			  ((data << 1) & MIP_VSSIP & csr.hideleg);
+		break;
+	case HSTATUS: csr.hstatus = data & HSTATUS_WMASK; break;
+	case HEDELEG: csr.hedeleg = data & HEDELEG_WMASK; break;
+	case HIDELEG: csr.hideleg = data & VS_INTERRUPTS; break;
+	case HCOUNTEREN: csr.hcounteren = data & 0xffffffffULL; break;
+	case HENVCFG: csr.henvcfg = data & 1; break;
+	case HGEIE: break;
+	case HTVAL: csr.htval = data; break;
+	case HTINST: csr.htinst = data; break;
+	case MTVAL2: csr.mtval2 = data; break;
+	case MTINST: csr.mtinst = data; break;
+	/* a write that selects an unsupported mode leaves the mode unchanged */
+	case HGATP:
+		if ((data >> 60) == 8 || (data >> 60) == 0)
+			csr.hgatp = data & (0xf000000000000000ULL | HGATP_PPN);
+		else
+			csr.hgatp = (csr.hgatp & 0xf000000000000000ULL) | (data & HGATP_PPN);
+		break;
+	case VSSTATUS: csr.vsstatus = data & SSTATUS_WMASK; break;
+	case VSTVEC: csr.vstvec = data & ~2ULL; break;
+	case VSSCRATCH: csr.vsscratch = data; break;
+	case VSEPC: csr.vsepc = data & ~3ULL; break;
+	case VSCAUSE: csr.vscause = data & CAUSE_WMASK; break;
+	case VSTVAL: csr.vstval = data; break;
+	case VSATP:
+		if ((data >> 60) == 8 || (data >> 60) == 0)
+			csr.vsatp = data & 0xf0000fffffffffffULL;
 		break;
 	/* only direct (0) and vectored (1) trap vector modes */
 	case MTVEC: csr.mtvec = data & ~2ULL; break;
@@ -254,8 +389,8 @@ bool csr_write(uint32_t no, word_t data)
 	/* instructions are 4 bytes: the low two bits of an epc are zero */
 	case MEPC: csr.mepc = data & ~3ULL; break;
 	case SEPC: csr.sepc = data & ~3ULL; break;
-	case MCAUSE: csr.mcause = data & (CAUSE_INTERRUPT | 0xf); break;
-	case SCAUSE: csr.scause = data & (CAUSE_INTERRUPT | 0xf); break;
+	case MCAUSE: csr.mcause = data & CAUSE_WMASK; break;
+	case SCAUSE: csr.scause = data & CAUSE_WMASK; break;
 	case MTVAL: csr.mtval = data; break;
 	case STVAL: csr.stval = data; break;
 	/* Sv39 or bare; a write selecting any other mode is ignored. There
@@ -277,6 +412,55 @@ static void csr_abort(const char *what, uint64_t no)
 	state = NEMU_ABORT;
 	printf(ANSI_FMT("%s: priv=%lu csr=%lx\n", ANSI_FG_RED), what,
 	       (unsigned long)priv_level, (unsigned long)no);
+}
+
+/* Interrupts are taken by the most privileged mode first: M, then HS, then
+ * VS. Within one mode the order is external, software, timer. */
+int csr_pending_interrupt(word_t pending)
+{
+	static const int order[] = {11, 3, 7, 9, 1, 5, 10, 2, 6};
+	const word_t mideleg = csr.mideleg | VS_INTERRUPTS;
+	const word_t active = pending & csr.mie;
+	const word_t level[3] = {
+		active & ~mideleg,
+		active & mideleg & ~csr.hideleg,
+		active & mideleg & csr.hideleg,
+	};
+	/* a mode takes its interrupts when it runs with them enabled, and
+	 * always while a less privileged mode runs */
+	const bool enabled[3] = {
+		priv_level < MACHINE || (csr.mstatus & MSTATUS_MIE),
+		priv_level < MACHINE &&
+			(virt_mode || priv_level == USER || (csr.mstatus & MSTATUS_SIE)),
+		virt_mode && (priv_level == USER || (csr.vsstatus & MSTATUS_SIE)),
+	};
+
+	for (int i = 0; i < 3; i++) {
+		if (!enabled[i])
+			continue;
+		for (unsigned k = 0; k < sizeof(order) / sizeof(order[0]); k++)
+			if ((level[i] >> order[k]) & 1)
+				return order[k];
+	}
+	return -1;
+}
+
+/* Where a trap is handled: 3 machine, 2 HS, 1 VS mode. */
+static int trap_target(bool interrupt, word_t code)
+{
+	const word_t deleg = interrupt ? (csr.mideleg | VS_INTERRUPTS) : csr.medeleg;
+	const word_t hdeleg = interrupt ? csr.hideleg : csr.hedeleg;
+
+	if (priv_level == MACHINE || !((deleg >> code) & 1))
+		return 3;
+	if (virt_mode && ((hdeleg >> code) & 1))
+		return 1;
+	return 2;
+}
+
+int csr_interrupt_code(int number)
+{
+	return trap_target(true, number) == 1 ? number - 1 : number;
 }
 
 bool priv_check(uint64_t no, bool is_write){
@@ -304,32 +488,66 @@ word_t raise_intr(word_t NO, vaddr_t epc, uint32_t args){
 	return csr.mtvec;
 }
 
-vaddr_t csr_trap(word_t cause, vaddr_t epc, word_t tval)
+/* The interrupt-enable stack of an S-level status register on a trap */
+static word_t status_trap(word_t status)
+{
+	status = (status & ~(MSTATUS_SPIE | MSTATUS_SPP)) |
+		 ((status & MSTATUS_SIE) ? MSTATUS_SPIE : 0) |
+		 (priv_level == SUPERVISOR ? MSTATUS_SPP : 0);
+	return status & ~MSTATUS_SIE;
+}
+
+vaddr_t csr_trap_guest(word_t cause, vaddr_t epc, word_t tval, word_t tval2,
+		       word_t tinst, bool gva)
 {
 	const bool interrupt = (cause & CAUSE_INTERRUPT) != 0;
-	const word_t code = cause & 0x3f;
-	const word_t deleg = interrupt ? csr.mideleg : csr.medeleg;
-	const word_t stored = (cause & CAUSE_INTERRUPT) | (code & 0xf);
+	word_t code = cause & 0x3f;
+	const int target = trap_target(interrupt, code);
 	word_t tvec;
 
-	if (priv_level <= SUPERVISOR && ((deleg >> code) & 1)) {
+	if (target == 1) {
+		/* the guest sees its own interrupt numbers */
+		if (interrupt)
+			code--;
+		csr.vsepc = epc & ~3ULL;
+		csr.vscause = (cause & CAUSE_INTERRUPT) | code;
+		csr.vstval = tval;
+		csr.vsstatus = status_trap(csr.vsstatus);
+		priv_level = SUPERVISOR;
+		tvec = csr.vstvec;
+	} else if (target == 2) {
 		csr.sepc = epc & ~3ULL;
-		csr.scause = stored;
+		csr.scause = (cause & CAUSE_INTERRUPT) | code;
 		csr.stval = tval;
-		csr.mstatus = (csr.mstatus & ~(MSTATUS_SPIE | MSTATUS_SPP)) |
-			      ((csr.mstatus & MSTATUS_SIE) ? MSTATUS_SPIE : 0) |
-			      (priv_level == SUPERVISOR ? MSTATUS_SPP : 0);
-		csr.mstatus &= ~MSTATUS_SIE;
+		csr.htval = tval2;
+		csr.htinst = tinst;
+		csr.mstatus = status_trap(csr.mstatus);
+		/* SPVP follows SPP, but only for a trap that leaves a guest */
+		csr.hstatus &= ~(HSTATUS_SPV | HSTATUS_GVA);
+		if (gva)
+			csr.hstatus |= HSTATUS_GVA;
+		if (virt_mode) {
+			csr.hstatus |= HSTATUS_SPV;
+			csr.hstatus = (csr.hstatus & ~HSTATUS_SPVP) |
+				      (priv_level == SUPERVISOR ? HSTATUS_SPVP : 0);
+		}
+		virt_mode = false;
 		priv_level = SUPERVISOR;
 		tvec = csr.stvec;
 	} else {
 		csr.mepc = epc & ~3ULL;
-		csr.mcause = stored;
+		csr.mcause = (cause & CAUSE_INTERRUPT) | code;
 		csr.mtval = tval;
-		csr.mstatus = (csr.mstatus & ~(MSTATUS_MPIE | MSTATUS_MPP)) |
+		csr.mtval2 = tval2;
+		csr.mtinst = tinst;
+		csr.mstatus = (csr.mstatus & ~(MSTATUS_MPIE | MSTATUS_MPP |
+					       MSTATUS_MPV | MSTATUS_GVA)) |
 			      ((csr.mstatus & MSTATUS_MIE) ? MSTATUS_MPIE : 0) |
-			      (priv_level << 11);
+			      (priv_level << 11) |
+			      (virt_mode ? MSTATUS_MPV : 0) |
+			      (gva ? MSTATUS_GVA : 0);
 		csr.mstatus &= ~MSTATUS_MIE;
+		virt_mode = false;
 		priv_level = MACHINE;
 		tvec = csr.mtvec;
 	}
@@ -340,25 +558,43 @@ vaddr_t csr_trap(word_t cause, vaddr_t epc, word_t tval)
 	return tvec & ~3ULL;
 }
 
+vaddr_t csr_trap(word_t cause, vaddr_t epc, word_t tval)
+{
+	return csr_trap_guest(cause, epc, tval, 0, 0, false);
+}
+
 vaddr_t csr_mret(void)
 {
 	priv_level = (csr.mstatus & MSTATUS_MPP) >> 11;
+	virt_mode = priv_level != MACHINE && (csr.mstatus & MSTATUS_MPV);
 	csr.mstatus = (csr.mstatus & ~MSTATUS_MIE) |
 		      ((csr.mstatus & MSTATUS_MPIE) ? MSTATUS_MIE : 0);
 	csr.mstatus |= MSTATUS_MPIE;
-	csr.mstatus &= ~MSTATUS_MPP;
+	csr.mstatus &= ~(MSTATUS_MPP | MSTATUS_MPV);
 	if (priv_level != MACHINE)
 		csr.mstatus &= ~MSTATUS_MPRV;
 	return csr.mepc;
 }
 
+/* In VS mode SRET works on vsstatus and stays in the guest; elsewhere it
+ * returns to the mode in sstatus.SPP and hstatus.SPV. */
 vaddr_t csr_sret(void)
 {
+	if (virt_mode) {
+		priv_level = (csr.vsstatus & MSTATUS_SPP) ? SUPERVISOR : USER;
+		csr.vsstatus = (csr.vsstatus & ~MSTATUS_SIE) |
+			       ((csr.vsstatus & MSTATUS_SPIE) ? MSTATUS_SIE : 0);
+		csr.vsstatus |= MSTATUS_SPIE;
+		csr.vsstatus &= ~MSTATUS_SPP;
+		return csr.vsepc;
+	}
 	priv_level = (csr.mstatus & MSTATUS_SPP) ? SUPERVISOR : USER;
+	virt_mode = (csr.hstatus & HSTATUS_SPV) != 0;
 	csr.mstatus = (csr.mstatus & ~MSTATUS_SIE) |
 		      ((csr.mstatus & MSTATUS_SPIE) ? MSTATUS_SIE : 0);
 	csr.mstatus |= MSTATUS_SPIE;
 	csr.mstatus &= ~(MSTATUS_SPP | MSTATUS_MPRV);
+	csr.hstatus &= ~HSTATUS_SPV;
 	return csr.sepc;
 }
 

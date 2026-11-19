@@ -7,7 +7,7 @@
 
 //macro
 #define MBASE 0x80000000
-#define MSIZE 0x8000000
+#define MSIZE 0x10000000
 #define SERIAL_BASE 0xa00003f8
 #define RTC_BASE 0xa0000048
 
